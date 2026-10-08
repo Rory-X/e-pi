@@ -8,6 +8,7 @@ import { ImportMultiRepoDialog } from "@/components/settings/ImportMultiRepoDial
 import { IconButton } from "@/components/ui/IconButton";
 import { SidebarInset, SidebarProvider, SidebarRail, Sidebar } from "@/components/ui/sidebar";
 import { AppHeader } from "@/components/workspace/AppHeader";
+import { AutomationPanel } from "@/components/workspace/AutomationPanel";
 import { Composer } from "@/components/workspace/Composer";
 import { SessionSidebar } from "@/components/workspace/SessionSidebar";
 import { SkillPanel } from "@/components/workspace/SkillPanel";
@@ -15,7 +16,8 @@ import { TerminalPanel } from "@/components/workspace/TerminalPanel";
 import { ToolPanel } from "@/components/workspace/ToolPanel";
 import type { PanelState, PanelTab, PanelView } from "@/components/workspace/ToolPanel";
 import { WorkspaceOverlayHost } from "@/components/workspace/WorkspaceOverlayHost";
-import { clearTerminalBuffer } from "@/lib/terminalReplayStore";
+import { sessionRenameDraft } from "@/lib/format";
+import { clearAllTerminalBuffers, clearTerminalBuffer } from "@/lib/terminalReplayStore";
 
 import { useGlobalShortcuts } from "./hooks/useGlobalShortcuts";
 import { useSessionRuntime } from "./hooks/useSessionRuntime";
@@ -46,6 +48,7 @@ export function App() {
   }, [unseenRuns]);
   const [packageOpen, setPackageOpen] = useState(false);
   const [skillOpen, setSkillOpen] = useState(false);
+  const [automationOpen, setAutomationOpen] = useState(false);
   const [renameTarget, setRenameTarget] = useState<SessionSummary>();
   const [renameName, setRenameName] = useState("");
   const [removeTarget, setRemoveTarget] = useState<SessionSummary>();
@@ -83,6 +86,20 @@ export function App() {
   /** Open tool-panel tabs plus the active one; review is a singleton. */
   const [panel, setPanel] = useState<PanelState>({ tabs: [], activeId: undefined });
   const overlays = useWorkspaceOverlays();
+
+  const handleAppInfoChange = useCallback(async () => {
+    const previousMode = appInfo?.tuiOptimizationsEnabled !== false;
+    const nextInfo = await refreshAppInfo();
+    const nextMode = nextInfo?.tuiOptimizationsEnabled !== false;
+    if (nextInfo && previousMode !== nextMode) {
+      // A fullscreen transcript and a stock main-screen transcript are not
+      // replay-compatible. Discard every cached frame after all processes have
+      // restarted, then let the newly mounted terminal receive a fresh frame.
+      clearAllTerminalBuffers();
+      setPaintedPaths(new Set());
+      setTerminalEpoch((current) => current + 1);
+    }
+  }, [appInfo, refreshAppInfo]);
 
   // Dev hot-reload restores the open editor/preview overlays.
   useEffect(() => {
@@ -272,15 +289,27 @@ export function App() {
   // Clicking a task-completion banner opens that session in the UI.
   useEffect(() => {
     return window.ePi.notifications.onOpenSession((sessionPath) => {
-      const session = sessions.find((candidate) => candidate.path === sessionPath);
-      if (!session) return;
-      selectSession(session);
+      if (!sessionPath) {
+        setAutomationOpen(true);
+        return;
+      }
+      void window.ePi.sessions
+        .list()
+        .then((fresh) => {
+          const session = fresh.find((candidate) => candidate.path === sessionPath);
+          if (session) {
+            setAutomationOpen(false);
+            selectSession(session);
+          } else setAutomationOpen(true);
+        })
+        .catch(() => setAutomationOpen(true));
     });
-  });
+  }, [selectSession]);
 
   const renameSession = useCallback(async (session: SessionSummary) => {
     setRenameTarget(session);
-    setRenameName(session.name || session.firstMessage);
+    // Never dump a multi-KB firstMessage into the dialog input — draft a short name.
+    setRenameName(sessionRenameDraft(session));
   }, []);
 
   const commitRename = async () => {
@@ -417,17 +446,32 @@ export function App() {
     setPanel((current) => (current.tabs.some((tab) => tab.id === id) ? { ...current, activeId: id } : current));
   }, []);
 
+  /** The project folder containing a workspace path (multi-repo sibling support). */
+  const folderContainingPath = useCallback(
+    (path: string): string | undefined => {
+      if (!activeProject) return undefined;
+      const normalized = path.replace(/\\/g, "/");
+      return activeProject.folders.find((folder) => normalized.startsWith(`${folder.replace(/\\/g, "/")}/`));
+    },
+    [activeProject],
+  );
+
   /** Open a workspace file through the preview/editor routing. */
+  const { openFilePreview: overlaysOpenFilePreview, openEditorFile: overlaysOpenEditorFile } = overlays;
   const handleOpenWorkspaceFile = useCallback(
     (path: string, imagePaths?: string[]) => {
-      if (!activeCwd) return;
+      // The file tree can browse every repo of a multi-repo project, so the
+      // read must be rooted at the folder containing the file — not the
+      // active session's cwd (which would trip the workspace confinement).
+      const cwd = folderContainingPath(path) ?? activeCwd;
+      if (!cwd) return;
       if (isWorkspacePreviewPath(path)) {
-        overlays.openFilePreview({ cwd: activeCwd, path, imagePaths });
+        overlaysOpenFilePreview({ cwd, path, imagePaths });
       } else {
-        overlays.openEditorFile({ cwd: activeCwd, path });
+        overlaysOpenEditorFile({ cwd, path });
       }
     },
-    [activeCwd, overlays],
+    [activeCwd, folderContainingPath, overlaysOpenEditorFile, overlaysOpenFilePreview],
   );
 
   /** Open a workspace path from inside previews (markdown links, images). */
@@ -447,15 +491,15 @@ export function App() {
       }
       if (absPath.startsWith(activeCwd)) {
         if (isWorkspacePreviewPath(absPath)) {
-          overlays.openFilePreview({ cwd: activeCwd, path: absPath });
+          overlaysOpenFilePreview({ cwd: activeCwd, path: absPath });
         } else {
-          overlays.openEditorFile({ cwd: activeCwd, path: absPath, line });
+          overlaysOpenEditorFile({ cwd: activeCwd, path: absPath, line });
         }
         return;
       }
       void window.ePi.app.openPath(absPath);
     },
-    [activeCwd, overlays],
+    [activeCwd, overlaysOpenEditorFile, overlaysOpenFilePreview],
   );
 
   // Workspace fs watching follows the active session cwd.
@@ -588,6 +632,7 @@ export function App() {
   const modalOpen =
     packageOpen ||
     skillOpen ||
+    automationOpen ||
     settingsOpen ||
     importOpen ||
     renameTarget !== undefined ||
@@ -628,11 +673,15 @@ export function App() {
           onCopyText={copyText}
           onOpenPackages={openPackages}
           onOpenSkills={openSkills}
+          onOpenAutomations={() => setAutomationOpen(true)}
           onOpenSettings={openSettings}
         />
 
         <div className="app-main">
-          <SidebarInset className="workspace">
+          <SidebarInset
+            className="workspace"
+            data-tui-optimizations={appInfo?.tuiOptimizationsEnabled !== false ? "true" : "false"}
+          >
             {" "}
             <div className="terminal-frame">
               {loading ? (
@@ -642,8 +691,9 @@ export function App() {
                 </div>
               ) : activeSession ? (
                 <TerminalPanel
-                  key={`${activeSession.path}:${terminalEpoch}`}
+                  key={`${activeSession.path}:${terminalEpoch}:${appInfo?.tuiOptimizationsEnabled === false ? "stock" : "optimized"}`}
                   sessionKey={activeSession.path}
+                  tuiOptimizationsEnabled={appInfo?.tuiOptimizationsEnabled !== false}
                   autoFocus={activePath === justCreatedPath && runtimeState?.status === "starting"}
                   onFirstPaint={handleFirstPaint}
                   onOpenFileLink={handleOpenFileLink}
@@ -743,11 +793,25 @@ export function App() {
         settingsOpen={settingsOpen}
         onSettingsOpenChange={setSettingsOpen}
         appInfo={appInfo}
-        onAppInfoChange={() => void refreshAppInfo()}
+        onAppInfoChange={() => void handleAppInfoChange()}
       />
 
       <PackagePanel open={packageOpen} cwd={activeCwd} onOpenChange={setPackageOpen} onReloadPi={onReloadPi} />
       <SkillPanel open={skillOpen} cwd={activeCwd} onOpenChange={setSkillOpen} onReloadPi={onReloadPi} />
+      <AutomationPanel
+        open={automationOpen}
+        cwd={activeCwd}
+        projects={projects}
+        runtime={runtimeState}
+        onOpenChange={setAutomationOpen}
+        onOpenSession={async (path) => {
+          const fresh = await window.ePi.sessions.list();
+          await refreshSessions();
+          const session = fresh.find((item) => item.path === path);
+          if (!session) throw new Error("Session was removed or archived. Restore it from Settings if archived.");
+          selectSession(session);
+        }}
+      />
       <ImportMultiRepoDialog
         open={importOpen}
         defaultPath={appInfo?.defaultCwd}

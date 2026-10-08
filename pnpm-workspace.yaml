@@ -1,0 +1,6 @@
+onlyBuiltDependencies:
+  - electron
+  - node-pty
+patchedDependencies:
+  "@earendil-works/pi-coding-agent@1.1.0": patches/@earendil-works__pi-coding-agent@1.1.0.patch
+  "@earendil-works/pi-tui@1.1.0": patches/@earendil-works__pi-tui@1.1.0.patch

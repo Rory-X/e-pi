@@ -8,6 +8,7 @@ import { net } from "electron";
 import type { PiUpdateInfo, PiUpdateResult } from "../../../src/types/contracts";
 import { debugLog } from "./debug-log";
 import { loadPiAgent, piPackageDir, piUpdateTargetDir } from "./pi-agent-loader";
+import { applyPiCompatibilityPatches } from "./pi-compatibility-service";
 
 /** Static fallback only; the real version is always read from disk. */
 const PI_VERSION = "0.0.0";
@@ -19,8 +20,26 @@ const DOWNLOAD_TIMEOUT_MS = 120_000;
 const INSTALL_TIMEOUT_MS = 10 * 60_000;
 /** How long a successful check is kept before hitting the registry again. */
 const CACHE_TTL_MS = 10 * 60 * 1000;
+export const PI_COMPATIBILITY_REQUIRED_PREFIX = "E_PI_TUI_COMPATIBILITY_REQUIRED";
+
+/**
+ * 0.85.0 published experimental code whose `dist/experimental/server.js`
+ * statically imports this package, but omitted it from `dependencies`. The
+ * import is on `cli.js`'s load path, so the package cannot even start without
+ * it. 0.85.1 removed the experimental code entirely, so only 0.85.0 is
+ * affected. Kept minimal and version-gated rather than scanning `dist`: the
+ * offending import is known and fixed upstream.
+ */
+const UNDECLARED_RUNTIME_COMPANIONS: Readonly<Record<string, readonly string[]>> = {
+  "0.85.0": ["@earendil-works/pi-server"],
+};
 
 let cached: { at: number; latest: string | undefined } | undefined;
+
+/** Test hook: isolate registry/update cache state between cases. */
+export function resetPiUpdateCacheForTests(): void {
+  cached = undefined;
+}
 
 const execFileAsync = promisify(execFile);
 
@@ -37,6 +56,32 @@ export function versionGt(a: string, b: string): boolean {
     if (diff !== 0) return diff > 0;
   }
   return false;
+}
+
+/**
+ * Add companions that a published version imports but omitted from
+ * `dependencies`, so a standalone `npm install --omit=dev` yields a loadable
+ * package. Version-gated: only releases with a known defect are touched, so a
+ * fixed release never picks up a dependency it does not need.
+ *
+ * Exported for tests.
+ */
+export function addUndeclaredRuntimeCompanions(pkg: Record<string, unknown>, version: string): string[] {
+  const wanted = UNDECLARED_RUNTIME_COMPANIONS[version];
+  if (!wanted || wanted.length === 0) return [];
+
+  const deps =
+    pkg.dependencies && typeof pkg.dependencies === "object" && !Array.isArray(pkg.dependencies)
+      ? (pkg.dependencies as Record<string, string>)
+      : {};
+  pkg.dependencies = deps;
+  const added: string[] = [];
+  for (const name of wanted) {
+    if (deps[name]) continue;
+    deps[name] = version;
+    added.push(name);
+  }
+  return added;
 }
 
 /**
@@ -118,14 +163,17 @@ export function readInstalledPiVersion(): string {
  *    `devDependencies` the npm registry tarball ships with — npm chokes on their peer sets during a standalone
  *    install.
  * 3. Install the package's own dependencies with `npm install --omit=dev`, producing a self-contained package directory.
- * 4. Atomically swap it into the location of the bundled pi package (rename the old directory aside, move the new one in),
+ * 4. Reapply and validate E-Pi's TUI compatibility layer while the update is still staged.
+ * 5. Atomically swap it into the location of the bundled pi package (rename the old directory aside, move the new one in),
  *    then delete the old one. The swap is all within one filesystem, so `renameSync` is atomic; the package's own
  *    node_modules are outside the asar in packaged builds, so they can be written freely.
- * 5. The caller restarts every live session so they pick up the new version.
+ * 6. The caller restarts every live session so they pick up the new version.
  *
  * Throws on any failure and leaves the existing installation untouched.
  */
-export async function applyPiUpdate(): Promise<PiUpdateResult> {
+export async function applyPiUpdate(
+  options: { tuiOptimizationsEnabled?: boolean; allowStockFallback?: boolean } = {},
+): Promise<PiUpdateResult> {
   // Read the *current* version from the live dir, but swap into the update
   // target — in dev these differ (target is userData, not the pnpm store).
   const installedDir = piUpdateTargetDir();
@@ -166,6 +214,10 @@ export async function applyPiUpdate(): Promise<PiUpdateResult> {
     const pkg = JSON.parse(readFileSync(pkgPath, "utf8")) as Record<string, unknown>;
     delete pkg.devDependencies;
     delete pkg.scripts;
+    const companions = addUndeclaredRuntimeCompanions(pkg, latest);
+    if (companions.length > 0) {
+      debugLog("[pi-update] adding undeclared runtime companions", { latest, companions });
+    }
     writeFileSync(pkgPath, JSON.stringify(pkg, null, 2));
 
     debugLog("[pi-update] installing dependencies", { latest });
@@ -193,6 +245,25 @@ export async function applyPiUpdate(): Promise<PiUpdateResult> {
       throw new Error("Downloaded pi package is missing dist/cli.js.");
     }
 
+    let fallbackToStock = false;
+    if (options.tuiOptimizationsEnabled !== false) {
+      debugLog("[pi-update] applying E-Pi compatibility layer", { latest });
+      try {
+        applyPiCompatibilityPatches(staged);
+      } catch (cause) {
+        if (!options.allowStockFallback) {
+          throw new Error(
+            `${PI_COMPATIBILITY_REQUIRED_PREFIX}:${latest}:Pi ${latest} changed TUI internals used by E-Pi's optimization patch.`,
+            { cause },
+          );
+        }
+        fallbackToStock = true;
+        debugLog("[pi-update] compatibility failed; continuing with stock pi-tui", { latest });
+      }
+    } else {
+      debugLog("[pi-update] keeping stock pi-tui (optimization patch disabled)", { latest });
+    }
+
     // Atomic swap within one filesystem.
     const parent = dirname(installedDir);
     const backup = join(parent, `.${basename(installedDir)}.old-${Date.now()}`);
@@ -216,7 +287,7 @@ export async function applyPiUpdate(): Promise<PiUpdateResult> {
     // Keep the version cache in sync so the next check reports up to date.
     cached = { at: Date.now(), latest: undefined };
     debugLog("[pi-update] done", { from: current, to: installedVersion, path: installedDir });
-    return { from: current, to: installedVersion, path: installedDir };
+    return { from: current, to: installedVersion, path: installedDir, fallbackToStock };
   } finally {
     removeRecursive(workDir);
   }

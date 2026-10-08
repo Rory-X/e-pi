@@ -3,7 +3,7 @@ import type { FSWatcher } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 
-import { app } from "electron";
+import { app, nativeTheme } from "electron";
 import type { IPty } from "node-pty";
 import { spawn } from "node-pty";
 
@@ -13,11 +13,13 @@ import type {
   ModelRef,
   PiActivityStatus,
   PiRuntimeState,
+  PiTurnResult,
   ResizeTerminalRequest,
   SessionUsageState,
   WaitingUserState,
 } from "../../../src/types/contracts";
 import { agentConfigToArgs, getAgentConfig } from "./agent-config-service";
+import { isTuiOptimizationsEnabled } from "./app-settings-service";
 import { debugLog } from "./debug-log";
 import { OutputBatcher } from "./output-batcher";
 import { piCliEntry } from "./pi-agent-loader";
@@ -58,6 +60,22 @@ function resolveBridgePath(): string {
 }
 
 /**
+ * Preload that installs E-Pi's runtime TUI hooks in the session process.
+ *
+ * Resolved by existence rather than `app.isPackaged` so it also works from a
+ * source checkout, where `process.resourcesPath` may point at the Electron
+ * binary's own resources. Returns undefined when the file is missing, so a
+ * build without the hooks still spawns pi normally.
+ */
+function resolveTuiPreloadPath(): string | undefined {
+  const candidates = [
+    ...(typeof process.resourcesPath === "string" ? [join(process.resourcesPath, "e-pi-tui-preload.mjs")] : []),
+    join(app.getAppPath(), "resources", "e-pi-tui-preload.mjs"),
+  ];
+  return candidates.find((candidate) => existsSync(candidate));
+}
+
+/**
  * The binary that runs each session's pi process. Defaults to the bundled
  * sidecar Node (`resources/node/bin/node`) — a plain Node binary with no
  * app-bundle association. Spawning the Electron main binary
@@ -85,13 +103,15 @@ function themeHintPath(): string {
   return join(app.getPath("userData"), "theme-hint.json");
 }
 
-/** Last theme the renderer reported; defaults to dark when unknown. */
+/** Last theme the renderer reported; OS appearance when the hint is missing. */
 function readThemeHint(): "dark" | "light" {
   try {
-    return readFileSync(themeHintPath(), "utf8").trim() === "light" ? "light" : "dark";
+    const saved = readFileSync(themeHintPath(), "utf8").trim();
+    if (saved === "light" || saved === "dark") return saved;
   } catch {
-    return "dark";
+    // First launch — follow the OS until the renderer reports.
   }
+  return nativeTheme.shouldUseDarkColors ? "dark" : "light";
 }
 
 function copyState(state: PiRuntimeState): PiRuntimeState {
@@ -107,7 +127,15 @@ function isRecord(value: unknown): value is Record<string, unknown> {
  * independent: switching the visible session never stops another session's
  * process, so agent runs continue in the background.
  */
+export interface RuntimeLaunchOptions {
+  background?: boolean;
+  signal?: AbortSignal;
+  model?: ModelRef;
+  thinkingLevel?: Exclude<AgentThinkingLevel, "">;
+}
+
 interface Instance {
+  launchOptions?: RuntimeLaunchOptions;
   sessionPath: string;
   cwd: string;
   generation: number;
@@ -137,9 +165,12 @@ export class PiRuntime {
    * preserved per session, and the last chunk before a process exits is
    * flushed by onExit so it is never dropped.
    */
-  readonly #outputBatcher = new OutputBatcher((sessionPath, data) => {
-    for (const listener of this.#globalDataListeners) listener(sessionPath, data);
-  });
+  readonly #outputBatcher = new OutputBatcher(
+    (sessionPath, data) => {
+      for (const listener of this.#globalDataListeners) listener(sessionPath, data);
+    },
+    { flushSynchronizedFrames: isTuiOptimizationsEnabled },
+  );
   /** Serializes lifecycle operations (start/stop) per session. */
   #chains = new Map<string, Promise<void>>();
 
@@ -229,10 +260,10 @@ export class PiRuntime {
     return () => this.#sessionFileListeners.delete(listener);
   }
 
-  async start(sessionPath: string, cwd: string): Promise<void> {
+  async start(sessionPath: string, cwd: string, options: RuntimeLaunchOptions = {}): Promise<void> {
     debugLog("[runtime] start() begin", { sessionPath, cwd });
-    this.#activeSessionPath = sessionPath;
-    await this.#chain(sessionPath, () => this.#ensureRunning(sessionPath, cwd));
+    if (!options.background) this.#activeSessionPath = sessionPath;
+    await this.#chain(sessionPath, () => this.#ensureRunning(sessionPath, cwd, options));
     debugLog("[runtime] start() done", { sessionPath });
   }
 
@@ -344,7 +375,7 @@ export class PiRuntime {
     return run;
   }
 
-  async #ensureRunning(sessionPath: string, cwd: string): Promise<void> {
+  async #ensureRunning(sessionPath: string, cwd: string, options: RuntimeLaunchOptions): Promise<void> {
     // Sessions launched from now on must start with the app's theme variant:
     // pi reads the auto theme setting ("dark/e-pi-light") plus COLORFGBG at
     // startup; the contrast-fixed light theme file must exist for pi to
@@ -358,6 +389,7 @@ export class PiRuntime {
     }
     // A placeholder may not know the session's real cwd yet; the caller does.
     instance.cwd = cwd;
+    if (options.model) instance.launchOptions = { model: options.model, thinkingLevel: options.thinkingLevel };
     if (
       instance.process !== undefined &&
       (instance.state.status === "running" ||
@@ -368,10 +400,10 @@ export class PiRuntime {
       // will relaunch after stop completes).
       return;
     }
-    await this.#launch(instance);
+    await this.#launch(instance, options.signal);
   }
 
-  async #launch(instance: Instance): Promise<void> {
+  async #launch(instance: Instance, abortSignal?: AbortSignal): Promise<void> {
     const { sessionPath, cwd } = instance;
     const launchT0 = performance.now();
     const launchMark = (label: string): void => {
@@ -389,11 +421,34 @@ export class PiRuntime {
 
     try {
       const nodeBinary = resolveNodeBinary();
+      const tuiOptimizationsEnabled = isTuiOptimizationsEnabled();
       const args = [resolvePiEntry(), "--session", sessionPath, "--extension", resolveBridgePath()];
+      // `--import` must precede the entry script: Node runs preloads before it
+      // resolves the entry, and the hooks have to be installed before any pi
+      // module is loaded. The preload installs them unconditionally and each
+      // injector checks E_PI_TUI_OPTIMIZATIONS at the point it acts, so
+      // toggling the setting takes effect without changing the spawn.
+      const preloadPath = resolveTuiPreloadPath();
+      if (preloadPath) args.unshift("--import", preloadPath);
+      else debugLog("[runtime] TUI hook preload not found; running without runtime injection", { sessionPath });
+      if (tuiOptimizationsEnabled) {
+        // E-Pi owns the outer composer and terminal viewport. Pi's regular
+        // main-screen renderer rebuilds and retransmits the entire session
+        // history whenever the PTY width changes; long sessions therefore
+        // spend seconds parsing an obsolete layout. Fullscreen mode keeps the
+        // document in pi and emits only the terminal-height viewport, with
+        // synchronized atomic frames and application-owned scrolling.
+        args.push("--tui-mode", "fullscreen");
+      }
       // E-Pi-managed Pi Agent settings (system prompt, thinking level, context
       // files). Re-read on every launch so `reloadAll` picks up saved changes.
-      const agentArgs = agentConfigToArgs(await getAgentConfig());
+      const agentConfig = await getAgentConfig();
+      if (instance.launchOptions?.thinkingLevel) agentConfig.thinkingLevel = instance.launchOptions.thinkingLevel;
+      const agentArgs = agentConfigToArgs(agentConfig);
       args.push(...agentArgs);
+      if (instance.launchOptions?.model) {
+        args.push("--provider", instance.launchOptions.model.provider, "--model", instance.launchOptions.model.id);
+      }
       debugLog("[runtime] spawning pi", { nodeBinary, args, cwd, sessionPath });
       launchMark("config resolved");
 
@@ -410,10 +465,15 @@ export class PiRuntime {
           TERM: "xterm-256color",
           COLORTERM: "truecolor",
           // Lets pi pick the right variant of an auto theme setting
-          // ("dark/light") at launch: fg/bg white on white for light, black
-          // on black for dark.
-          COLORFGBG: this.#themeHint === "light" ? "15;7" : "15;0",
+          // ("e-pi-light/dark") at launch. Index 7 (#c0c0c0) is only barely
+          // "light" under pi's luminance check; 15 is unambiguously white.
+          COLORFGBG: this.#themeHint === "light" ? "0;15" : "15;0",
           E_PI: "true",
+          E_PI_TUI_OPTIMIZATIONS: tuiOptimizationsEnabled ? "true" : "false",
+          // Where the bridge extension can find the editor's project registry
+          // (projects.json in Electron userData) so multi-repo workspaces are
+          // visible to the agent without a restart.
+          E_PI_USER_DATA: app.getPath("userData"),
           // Surface pi's own startup timings (stderr) when profiling startup.
           // Deliberately a separate switch: E_PI_DEBUG is for E-Pi's own logs
           // and must never change what the user sees in the terminal.
@@ -494,7 +554,7 @@ export class PiRuntime {
       });
 
       this.#watchActivity(instance);
-      await this.#waitUntilReady(instance, child);
+      await this.#waitUntilReady(instance, child, abortSignal);
       launchMark("ready (activity sidecar)");
       this.#setState(instance, {
         ...instance.state,
@@ -525,13 +585,18 @@ export class PiRuntime {
     }
   }
 
-  async #waitUntilReady(instance: Instance, child: IPty): Promise<void> {
+  async #waitUntilReady(instance: Instance, child: IPty, signal?: AbortSignal): Promise<void> {
     const activityPath = join(dirname(instance.sessionPath), `${basename(instance.sessionPath)}${ACTIVITY_SUFFIX}`);
     await new Promise<void>((resolve, reject) => {
       let reading = false;
       let timeout: NodeJS.Timeout | undefined;
       let stopOutput: { dispose: () => void } | undefined;
+      let finished = false;
+      const abort = () => finish(new Error("Pi launch was cancelled."));
       const finish = (error?: Error): void => {
+        if (finished) return;
+        finished = true;
+        signal?.removeEventListener("abort", abort);
         stopOutput?.dispose();
         clearInterval(interval);
         if (timeout) clearTimeout(timeout);
@@ -547,8 +612,22 @@ export class PiRuntime {
         reading = true;
         void readFile(activityPath, "utf8")
           .then((raw) => {
-            const status = (JSON.parse(raw) as { status?: unknown }).status;
-            if (status === "busy" || status === "idle") finish();
+            if (finished) return;
+            const parsed = JSON.parse(raw) as { status?: unknown; model?: ModelRef; thinkingLevel?: string };
+            if (parsed.status === "busy" || parsed.status === "idle") {
+              this.#setState(instance, {
+                ...instance.state,
+                activity: parsed.status,
+                model:
+                  typeof parsed.model?.provider === "string" && typeof parsed.model.id === "string"
+                    ? parsed.model
+                    : instance.state.model,
+                thinkingLevel: THINKING_LEVELS.includes(parsed.thinkingLevel as Exclude<AgentThinkingLevel, "">)
+                  ? (parsed.thinkingLevel as Exclude<AgentThinkingLevel, "">)
+                  : instance.state.thinkingLevel,
+              });
+              finish();
+            }
           })
           .catch(() => undefined)
           .finally(() => {
@@ -566,7 +645,9 @@ export class PiRuntime {
         timeout = setTimeout(() => finish(new Error("Pi terminal did not become ready in time.")), READY_TIMEOUT_MS);
       });
       timeout = setTimeout(() => finish(new Error("Pi terminal did not become ready in time.")), READY_TIMEOUT_MS);
-      check();
+      signal?.addEventListener("abort", abort, { once: true });
+      if (signal?.aborted) abort();
+      else check();
     });
     debugLog("[runtime] terminal ready", { sessionPath: instance.sessionPath, pid: child.pid });
   }
@@ -600,6 +681,7 @@ export class PiRuntime {
             cacheHitRate?: unknown;
             speed?: unknown;
             waitingUser?: unknown;
+            turnResult?: unknown;
           };
           const activity =
             parsed.status === "busy" || parsed.status === "idle" ? (parsed.status as PiActivityStatus) : undefined;
@@ -658,7 +740,21 @@ export class PiRuntime {
                     detail: typeof rawWaiting.detail === "string" ? rawWaiting.detail : undefined,
                   }
                 : (instance.state.waitingUser ?? undefined);
+          const rawResult = parsed.turnResult;
+          const turnResult: PiTurnResult | null | undefined =
+            rawResult === null
+              ? null
+              : isRecord(rawResult) &&
+                  typeof rawResult.serial === "number" &&
+                  (rawResult.status === "success" || rawResult.status === "error" || rawResult.status === "cancelled")
+                ? {
+                    serial: rawResult.serial,
+                    status: rawResult.status,
+                    error: typeof rawResult.error === "string" ? rawResult.error : undefined,
+                  }
+                : instance.state.turnResult;
           const signature = JSON.stringify({
+            turnResult,
             activity,
             model,
             thinkingLevel,
@@ -670,6 +766,7 @@ export class PiRuntime {
             waitingUser,
           });
           const previous = JSON.stringify({
+            turnResult: instance.state.turnResult,
             activity: instance.state.activity,
             model: instance.state.model,
             thinkingLevel: instance.state.thinkingLevel,
@@ -686,6 +783,7 @@ export class PiRuntime {
             this.#setState(instance, {
               ...instance.state,
               activity,
+              turnResult,
               model: model ?? instance.state.model,
               thinkingLevel: thinkingLevel ?? instance.state.thinkingLevel,
               supportedThinkingLevels: supportedThinkingLevels ?? instance.state.supportedThinkingLevels,

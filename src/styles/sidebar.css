@@ -113,9 +113,7 @@
 }
 
 .sidebar-session-group {
-  min-height: 0;
-  flex: 1;
-  overflow: hidden;
+  flex: 0 0 auto;
 }
 
 .sidebar-session-group .sidebar-group-label {
@@ -159,14 +157,18 @@
   box-shadow: 0 0 0 2px var(--sidebar-ring);
 }
 
-.sidebar-session-group .sidebar-group-content {
+.sidebar-content {
+  display: flex;
+  min-width: 0;
   min-height: 0;
   flex: 1;
-  overflow-x: hidden;
-  overflow-y: auto;
+  flex-direction: column;
+  overflow: hidden;
 }
 
-.sidebar-content {
+/* Pinned and PROJECTS share this one scroller. Skills / Packages / New
+   session stay above it; Settings stays in the footer. */
+.sidebar-list-scroll {
   display: flex;
   min-width: 0;
   min-height: 0;
@@ -202,6 +204,7 @@
 .session-menu-button {
   min-height: 38px;
   grid-template-columns: auto minmax(0, 1fr) auto;
+  user-select: none;
 }
 
 /* Activity glyph before the session title: 3x3 dot-matrix canvas shared by
@@ -217,21 +220,21 @@
 }
 
 .session-activity.working {
-  color: #8db9e8;
+  color: var(--info);
 }
 
 /* Blocked on the human (permission prompt / ask-user): amber “?”. The turn
    is NOT finished — the agent paused and resumes once the user interacts. */
 .session-activity.waiting {
-  color: var(--warning, #eab308);
+  color: var(--warning);
 }
 
 .session-activity.done {
-  color: #74d6a5;
+  color: var(--success);
 }
 
 .session-activity.error {
-  color: #ed8b92;
+  color: var(--destructive);
 }
 
 .session-activity-matrix {
@@ -449,25 +452,48 @@
   background: var(--sidebar-accent);
 }
 
-/* Pinned sessions float above the project groups. */
+/* Pinned sessions sit above the project groups, inside the shared list scroller. */
 .pinned-sessions {
   /* 8px left padding replaces .sidebar-group's side padding: this block
      renders outside the group, and its label/rows must align with RECENT. */
-  margin: 2px 0 6px;
+  margin: 2px 0 0;
   padding: 0 0 4px 8px;
-  border-bottom: 1px solid var(--border);
+  flex: 0 0 auto;
 }
 
 .pinned-sessions-label {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  gap: 3px;
   padding: 2px 8px 3px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
   color: var(--muted-foreground);
+  font: inherit;
   font-size: var(--fs-mini);
   font-weight: 600;
   letter-spacing: 0.05em;
   text-transform: uppercase;
+  text-align: left;
+  cursor: pointer;
 }
 
-/* Default-folder sessions, listed flat above the project groups. The top
+.pinned-sessions-label:hover {
+  color: var(--foreground);
+}
+
+.pinned-sessions-chevron {
+  flex: 0 0 auto;
+  transition: transform 120ms ease;
+}
+
+.pinned-sessions-label.collapsed .pinned-sessions-chevron {
+  transform: rotate(-90deg);
+}
+
+/* Default-folder sessions, listed flat under the project groups. The top
    border separates RECENT from the workspace groups above it. */
 .sidebar-recent {
   margin-top: 4px;
@@ -708,19 +734,10 @@
 }
 
 /* Right tool panel opens/closes by resizing the grid column, which resizes
-   the terminal next door. With the 180ms width animation the ResizeObserver
-   refits the xterm every frame (repaint + PTY SIGWINCH + scroll-restore
-   races, visible as a flash and the scrollbar jumping to the top). Snap to
-   the target width instead so the terminal refits exactly once. Rail drags
-   already force transition:none above, so this only changes the toggle
-   animation, not drag behavior. */
-/* Right tool panel opens/closes by resizing the grid column, which resizes
-   the terminal next door. The width transition was dropped when every
-   animation frame caused a full xterm refit + PTY SIGWINCH (flicker,
-   scrollbar jump); the scheduler now reflows xterm locally per frame and
-   throttles PTY resizes, so the 180ms animation is smooth again — same
-   behavior as the left sidebar. Rail drags still force transition:none
-   below, so dragging tracks the pointer 1:1. */
+   the terminal next door. During the 180ms animation xterm reflows a guarded
+   local preview and Pi receives latest-wins grid updates; tagged old-size
+   frames are discarded before presentation. Rail drags still force
+   transition:none above, so direct dragging tracks the pointer 1:1. */
 .sidebar-root[data-side="right"] .sidebar-container {
   border-right: none;
   border-left: 1px solid var(--sidebar-border);
@@ -963,7 +980,7 @@
 }
 
 .project-info-primary {
-  color: var(--warning, #eab308);
+  color: var(--warning);
   flex: 0 0 auto;
 }
 

@@ -24,6 +24,8 @@
 }
 
 .terminal-frame {
+  --terminal-bottom-fade-height: 88px;
+
   position: relative;
   min-width: 0;
   min-height: 0;
@@ -31,10 +33,9 @@
   background: var(--background);
 }
 
-/* Fade the scrollback out near the bottom edge so the junction with the
-   composer reads as a smooth transition instead of a hard cut. */
-.terminal-frame::after {
-  content: "";
+/* The disabled mode deliberately preserves the local master branch's host
+   fade, dimensions, and control placement. */
+.workspace[data-tui-optimizations="false"] .terminal-frame::after {
   position: absolute;
   right: 0;
   bottom: 0;
@@ -47,6 +48,30 @@
     color-mix(in oklch, var(--background) 60%, transparent) 72%,
     var(--background)
   );
+  content: "";
+  pointer-events: none;
+}
+
+/* Keep the veil present at all times so the terminal and floating quick
+   commands read as one stable bottom layer. Optimized Pi adds blank transcript
+   rows at the live tail; while scrolled up, history can still pass underneath
+   and disappear through this gradient. */
+.terminal-bottom-fade {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  z-index: 1;
+  height: var(--terminal-bottom-fade-height);
+  background: linear-gradient(
+    to bottom,
+    transparent,
+    color-mix(in oklch, var(--background) 10%, transparent) 20%,
+    color-mix(in oklch, var(--background) 42%, transparent) 50%,
+    color-mix(in oklch, var(--background) 82%, transparent) 78%,
+    var(--background)
+  );
+  opacity: 1;
   pointer-events: none;
 }
 
@@ -55,10 +80,9 @@
 .terminal-scroll-bottom {
   position: absolute;
   left: 50%;
-  /* Raised above the quick-command pill row (which floats over the
-     composer's top edge, i.e. the terminal's bottom strip) so the two
-     never overlap — kept close enough to the bottom to feel attached. */
-  bottom: 40px;
+  /* Straddle the fade's top edge: the arrow reads as a control attached to
+     the disappearing transcript rather than an item occupying terminal rows. */
+  bottom: calc(var(--terminal-bottom-fade-height) - 14px);
   translate: -50% 0;
   z-index: 2;
   display: grid;
@@ -97,11 +121,34 @@
   transform: translateY(1px);
 }
 
+.workspace[data-tui-optimizations="false"] .terminal-scroll-bottom {
+  bottom: 40px;
+}
+
 .terminal-panel {
+  box-sizing: border-box;
   width: 100%;
   height: 100%;
   padding: 10px 12px 4px;
   user-select: text;
+}
+
+/* Reserve the left rail strip for the session navigator so transcript text
+   never slides under the bars (optimized mode only; stock keeps its padding). */
+.workspace[data-tui-optimizations="true"] .terminal-panel {
+  /* Right: 12px base + 12px requested clearance. When the right tool panel is
+     collapsed the rail hit area still extends 4px into the terminal, so the
+     clearance keeps text out from under it. */
+  padding-right: 12px;
+  padding-left: 52px;
+}
+
+/* The collapsed right tool panel must not paint over the terminal's right
+   edge while its width animates to 0: overflow:hidden alone leaves a painted
+   strip during the 180ms transition because the grid column tracks the
+     width. Clipping visibility as well drops the whole strip immediately. */
+.sidebar-root[data-side="right"][data-collapsible="offcanvas"][data-state="collapsed"] {
+  visibility: hidden;
 }
 
 /* Loading state while the session's TUI has not painted yet (pi booting or
@@ -142,6 +189,13 @@
 
 .terminal-panel .xterm {
   height: 100%;
+}
+
+.workspace[data-tui-optimizations="true"] .terminal-panel .xterm {
+  /* Keep xterm's internal resize snapshot in this stacking context. Without
+     isolation its high renderer-layer z-index can escape the terminal and
+     cover the quick-command pills that intentionally overlap the bottom edge. */
+  isolation: isolate;
 }
 
 .terminal-panel .xterm-viewport {
@@ -606,7 +660,10 @@
    is raised out of this strip, so no horizontal reservation is needed. */
 .composer-quick-commands {
   position: absolute;
-  bottom: calc(100% + 14px);
+  /* Sit inside the composer's reserved top gap. Keeping the row closer to
+     the input prevents tall pills from crossing into the terminal's final
+     live row while retaining the floating treatment. */
+  bottom: calc(100% + 6px);
   /* Align with the input's inner padding (16px) rather than the card edge. */
   left: 14px;
   display: flex;
@@ -630,11 +687,21 @@
   font-size: var(--fs-small);
   /* Keep the pill's own label on a single line; the row scrolls instead. */
   white-space: nowrap;
-  box-shadow: 0 4px 14px color-mix(in oklch, var(--foreground) 14%, transparent);
+  box-shadow:
+    0 -8px 18px color-mix(in oklch, var(--foreground) 10%, transparent),
+    0 4px 14px color-mix(in oklch, var(--foreground) 14%, transparent);
   cursor: pointer;
   transition:
     border-color 120ms ease,
     background 120ms ease;
+}
+
+.workspace[data-tui-optimizations="false"] .composer-quick-commands {
+  bottom: calc(100% + 14px);
+}
+
+.workspace[data-tui-optimizations="false"] .composer-quick-command {
+  box-shadow: 0 4px 14px color-mix(in oklch, var(--foreground) 14%, transparent);
 }
 
 .composer-quick-command:hover {
@@ -931,4 +998,136 @@
 }
 .composer-send:active {
   transform: translateY(1px);
+}
+
+/* ChatGPT-style session navigator: thin centered rail on the transcript's
+   left edge. Each user message is a short bar; hovering elongates it with a
+   stepped gradient on its neighbors, and shows only that message's title.
+   Colors match the xterm palette foreground (terminalTheme.ts) so the bars
+   always contrast the terminal canvas. */
+.message-nav {
+  position: absolute;
+  top: 0;
+  bottom: var(--terminal-bottom-fade-height);
+  left: 0;
+  z-index: 3;
+  pointer-events: none;
+}
+
+.message-nav-rail {
+  position: absolute;
+  top: 50%;
+  left: 0;
+  width: 44px;
+  padding-left: 8px;
+  translate: 0 -50%;
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  /* Bars carry a 12px hit area; negative margins collapse the overlap so the
+     visual gap is ~4px while every bar stays clickable. */
+  gap: 0;
+  max-height: 80%;
+  overflow: hidden;
+  pointer-events: auto;
+}
+
+.message-nav-tick + .message-nav-tick {
+  margin-top: -2px;
+}
+
+.message-nav-tick {
+  flex: none;
+  display: flex;
+  align-items: center;
+  width: 8px;
+  /* Tall invisible hit area; the visible bar is the 2px ::before line. */
+  height: 12px;
+  padding: 0;
+  border: none;
+  border-radius: 0;
+  background: transparent;
+  cursor: pointer;
+  transition: width 140ms ease;
+}
+
+.message-nav-tick::before {
+  display: block;
+  flex: none;
+  width: 100%;
+  height: 2px;
+  box-shadow: 0 2px 0 0 rgb(36 41 47 / 55%);
+  content: "";
+  transition: box-shadow 140ms ease;
+}
+
+.dark .message-nav-tick::before {
+  box-shadow: 0 2px 0 0 rgb(215 224 233 / 60%);
+}
+
+.message-nav-tick[data-level="1"] {
+  width: 18px;
+}
+
+.message-nav-tick[data-level="2"] {
+  width: 24px;
+}
+
+.message-nav-tick[data-level="3"] {
+  width: 32px;
+}
+
+.message-nav-tick[data-level="3"]::before {
+  box-shadow: 0 2px 0 0 rgb(36 41 47 / 85%);
+}
+
+.dark .message-nav-tick[data-level="3"]::before {
+  box-shadow: 0 2px 0 0 rgb(215 224 233 / 88%);
+}
+
+.message-nav-tick[data-active="true"]::before {
+  box-shadow: 0 2px 0 0 rgb(36 41 47 / 95%);
+}
+
+.dark .message-nav-tick[data-active="true"]::before {
+  box-shadow: 0 2px 0 0 rgb(240 244 247 / 95%);
+}
+
+.message-nav-tip {
+  /* Tracks the hovered bar vertically (inline top), clamped inside the rail. */
+  position: absolute;
+  left: 46px;
+  min-height: 14px;
+  /* Fit the title up to a cap; absolute + max-width alone shrink-wraps to the
+     narrowest word when the parent is narrow. */
+  width: max-content;
+  max-width: 260px;
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: color-mix(in oklch, var(--popover, var(--card)) 97%, transparent);
+  box-shadow: 0 4px 16px color-mix(in oklch, var(--foreground) 14%, transparent);
+  color: var(--foreground);
+  font-size: var(--fs-small, 11px);
+  line-height: 1.4;
+  translate: 0 -50%;
+  pointer-events: none;
+}
+
+/* User message: single line, ellipsis. */
+.message-nav-tip-title {
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+/* Assistant reply preview: at most two lines, ellipsis. */
+.message-nav-tip-reply {
+  margin-top: 2px;
+  overflow: hidden;
+  color: var(--muted-foreground);
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
 }

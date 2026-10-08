@@ -347,20 +347,23 @@
 }
 
 .package-update-action svg {
-  color: var(--chart-2);
+  color: var(--info);
+}
+
+.package-update-all {
+  height: 26px;
+  padding: 0 8px;
+  font-size: var(--fs-small);
+}
+
+.package-update-all svg {
+  color: var(--info);
 }
 
 .package-row-actions {
   display: flex;
   flex: 0 0 auto;
   gap: 1px;
-  opacity: 0;
-  transition: opacity 120ms ease;
-}
-
-.package-row:hover .package-row-actions,
-.package-row:focus-within .package-row-actions {
-  opacity: 1;
 }
 
 .package-empty {

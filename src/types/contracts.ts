@@ -49,6 +49,8 @@ export interface AppInfo {
   homeDir: string;
   /** .app bundle path for the file tree's "open with"; undefined = system default. */
   openWithApp?: string;
+  /** Whether E-Pi injects its smooth resize/scrolling layer into Pi's TUI. */
+  tuiOptimizationsEnabled: boolean;
 }
 
 export interface AppDescriptor {
@@ -75,6 +77,8 @@ export interface PiUpdateResult {
   to: string;
   /** Path to the package directory the new version was installed into. */
   path: string;
+  /** True when the user explicitly accepted an unpatched stock fallback. */
+  fallbackToStock?: boolean;
 }
 
 export interface SessionSummary {
@@ -88,6 +92,7 @@ export interface SessionSummary {
   messageCount: number;
   firstMessage: string;
   searchText: string;
+  automation?: { taskId: string; runId: string };
 }
 
 /**
@@ -155,6 +160,8 @@ export interface PiRuntimeState {
    * The turn is NOT finished — it continues once the user interacts.
    */
   waitingUser?: WaitingUserState | null;
+  /** Completion survives missed busy/idle sidecar updates for short runs. */
+  turnResult?: PiTurnResult | null;
   /** Model currently selected inside this session's Pi process. */
   model?: ModelRef;
   /** Current thinking level inside this session's Pi process (after model clamping). */
@@ -173,6 +180,82 @@ export interface PiRuntimeState {
   exitCode?: number;
   signal?: number;
   error?: string;
+}
+
+export interface PiTurnResult {
+  serial: number;
+  status: "success" | "error" | "cancelled";
+  error?: string;
+}
+
+export type AutomationSchedule =
+  | { kind: "once"; localDateTime: string }
+  | { kind: "interval"; every: number; unit: "minutes" | "hours"; anchor: string }
+  | { kind: "weekly"; weekdays: number[]; time: string };
+
+export interface AutomationInput {
+  name: string;
+  prompt: string;
+  cwd: string;
+  skill?: { name: string; filePath: string };
+  model: ModelRef;
+  thinkingLevel: Exclude<AgentThinkingLevel, "">;
+  schedule: AutomationSchedule;
+  timezone: string;
+  timeoutMinutes: number;
+  notifyOnSuccess: boolean;
+}
+
+export interface AutomationTask extends AutomationInput {
+  id: string;
+  enabled: boolean;
+  createdAt: string;
+  updatedAt: string;
+  nextRunAt?: string;
+  deletedAt?: string;
+}
+
+export type AutomationRunStatus =
+  | "queued"
+  | "starting"
+  | "running"
+  | "waiting"
+  | "success"
+  | "failed"
+  | "cancelled"
+  | "timed_out"
+  | "skipped"
+  | "missed";
+
+export interface AutomationRun {
+  id: string;
+  taskId: string;
+  taskName: string;
+  cwd: string;
+  timezone: string;
+  scheduledAt: string;
+  createdAt: string;
+  trigger: "schedule" | "manual";
+  status: AutomationRunStatus;
+  startedAt?: string;
+  finishedAt?: string;
+  sessionPath?: string;
+  elapsedMs: number;
+  detail?: string;
+  missedCount?: number;
+  /** Snapshot: edits cannot change an already queued/running execution. */
+  config: AutomationInput;
+}
+
+export interface AutomationState {
+  tasks: AutomationTask[];
+  runs: AutomationRun[];
+  error?: string;
+}
+
+export interface AutomationSaveRequest {
+  id?: string;
+  input: AutomationInput;
 }
 
 export interface PackageRecord {
@@ -252,6 +335,12 @@ export interface ResizeTerminalRequest {
   rows: number;
 }
 
+export interface SideTerminalStatus {
+  cwd: string;
+  foregroundProcess: string;
+  interactive: boolean;
+}
+
 export type ModelAuthType = "api_key" | "oauth";
 
 export interface ModelRecord {
@@ -263,6 +352,7 @@ export interface ModelRecord {
   contextWindow: number;
   maxTokens: number;
   available: boolean;
+  supportedThinkingLevels?: Exclude<AgentThinkingLevel, "">[];
 }
 
 export interface ModelProviderRecord {
@@ -281,6 +371,7 @@ export interface ModelProviderRecord {
 export interface ModelManagementState {
   providers: ModelProviderRecord[];
   defaultModel?: ModelRef;
+  defaultThinkingLevel?: Exclude<AgentThinkingLevel, "">;
   error?: string;
 }
 
@@ -614,7 +705,9 @@ export interface EPiApi {
      * session so they run the new version. Resolves with the result of the
      * update (the previous version and the newly installed one).
      */
-    applyPiUpdate(): Promise<PiUpdateResult>;
+    applyPiUpdate(options?: { allowStockFallback?: boolean }): Promise<PiUpdateResult>;
+    /** Toggle E-Pi's injectable TUI optimization layer and restart live sessions. */
+    setTuiOptimizationsEnabled(enabled: boolean): Promise<AppInfo>;
     chooseDirectory(defaultPath?: string): Promise<string | undefined>;
     /** Pick one or more folders (multi-repo projects). */
     chooseDirectories(defaultPath?: string): Promise<string[]>;
@@ -623,6 +716,10 @@ export interface EPiApi {
     pasteImage(): Promise<string | null>;
     imageData(filePath: string, maxSize?: number): Promise<string | null>;
     openPath(path: string): Promise<void>;
+    /** Write a file into the OS temp dir; content is base64 when base64=true (binary). Returns its path. */
+    writeTempFile(fileName: string, content: string, base64?: boolean): Promise<string>;
+    /** Delete a file previously created via writeTempFile (only allowed inside the temp dir). */
+    removeTempFile(path: string): Promise<void>;
     /** Reveal the item in Finder (macOS) / Explorer (Windows) / file manager (Linux). */
     showInFolder(path: string): Promise<void>;
     /** Open a file with a specific app bundle (macOS). */
@@ -631,7 +728,7 @@ export interface EPiApi {
     chooseApp(): Promise<string | undefined>;
     /** Apps scanned from the system that can be used to open files ([] on non-macOS). */
     listApps(): Promise<AppDescriptor[]>;
-    /** Apps declared to open the given file extension (fallback: dev apps). */
+    /** Apps ranked for the given file extension (macOS Open With). */
     appsForExtension(extension: string): Promise<AppDescriptor[]>;
     /** Persist the default "open with" app; undefined restores the system default. */
     setOpenWithApp(appPath: string | undefined): Promise<AppInfo>;
@@ -704,7 +801,7 @@ export interface EPiApi {
     onProgress(listener: (progress: PackageProgress) => void): () => void;
   };
   models: {
-    list(): Promise<ModelManagementState>;
+    list(cwd?: string): Promise<ModelManagementState>;
     login(request: ModelLoginRequest): Promise<ModelManagementState>;
     respondToLogin(response: ModelLoginResponse): void;
     cancelLogin(): void;
@@ -753,6 +850,15 @@ export interface EPiApi {
     remove(request: SkillMutation): Promise<SkillRecord[]>;
     setEnabled(request: SkillSetEnabledRequest): Promise<SkillRecord[]>;
   };
+  automations: {
+    list(): Promise<AutomationState>;
+    save(request: AutomationSaveRequest): Promise<AutomationState>;
+    setEnabled(id: string, enabled: boolean): Promise<AutomationState>;
+    remove(id: string): Promise<AutomationState>;
+    runNow(id: string): Promise<AutomationState>;
+    stop(runId: string): Promise<AutomationState>;
+    onUpdated(listener: (state: AutomationState) => void): () => void;
+  };
   git: {
     status(cwd: string): Promise<GitStatus>;
     diff(cwd: string, path: string): Promise<GitDiffResult>;
@@ -791,9 +897,17 @@ export interface EPiApi {
   };
   sideTerminal: {
     spawn(cwd: string): Promise<string>;
+    status(id: string): Promise<SideTerminalStatus | undefined>;
     write(id: string, data: string): void;
     resize(id: string, size: ResizeTerminalRequest): void;
     kill(id: string): void;
+    /**
+     * True while the overlay editor owns line editing: the pty switches to
+     * no-echo/non-canonical mode (the overlay paints the glyphs, the kernel
+     * must not also echo them). False restores the kernel's cooked mode for
+     * interactive programs.
+     */
+    setEditorMode(id: string, active: boolean): void;
     onData(listener: (id: string, data: string) => void): () => void;
   };
 }

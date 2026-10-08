@@ -1,6 +1,8 @@
 import { contextBridge, ipcRenderer, webUtils } from "electron";
 
 import type {
+  AutomationSaveRequest,
+  AutomationState,
   ArchivedSessionSummary,
   AgentConfigSaveRequest,
   AppDescriptor,
@@ -48,6 +50,7 @@ import type {
   ResizeTerminalRequest,
   SetDefaultModelRequest,
   SessionSummary,
+  SideTerminalStatus,
   SkillAddPathRequest,
   SkillCreateRequest,
   SkillMutation,
@@ -70,7 +73,10 @@ const api: EPiApi = {
     getInfo: () => ipcRenderer.invoke("app:get-info") as Promise<AppInfo>,
     setDefaultCwd: (cwd: string) => ipcRenderer.invoke("app:set-default-cwd", cwd) as Promise<AppInfo>,
     checkPiUpdate: () => ipcRenderer.invoke("app:check-pi-update") as Promise<PiUpdateInfo>,
-    applyPiUpdate: () => ipcRenderer.invoke("app:apply-pi-update") as Promise<PiUpdateResult>,
+    applyPiUpdate: (options?: { allowStockFallback?: boolean }) =>
+      ipcRenderer.invoke("app:apply-pi-update", options) as Promise<PiUpdateResult>,
+    setTuiOptimizationsEnabled: (enabled: boolean) =>
+      ipcRenderer.invoke("app:set-tui-optimizations", enabled) as Promise<AppInfo>,
     chooseDirectory: (defaultPath?: string) =>
       ipcRenderer.invoke("app:choose-directory", defaultPath) as Promise<string | undefined>,
     chooseDirectories: (defaultPath?: string) =>
@@ -81,6 +87,9 @@ const api: EPiApi = {
     imageData: (filePath: string, maxSize?: number) =>
       ipcRenderer.invoke("app:image-data", filePath, maxSize) as Promise<string | null>,
     openPath: (path: string) => ipcRenderer.invoke("app:open-path", path) as Promise<void>,
+    writeTempFile: (fileName: string, content: string, base64?: boolean) =>
+      ipcRenderer.invoke("app:write-temp-file", fileName, content, base64) as Promise<string>,
+    removeTempFile: (path: string) => ipcRenderer.invoke("app:remove-temp-file", path) as Promise<void>,
     /** Reveal the item in Finder (macOS) / Explorer (Windows) / file manager (Linux). */
     showInFolder: (path: string) => ipcRenderer.invoke("app:show-in-folder", path) as Promise<void>,
     openWith: (appPath: string, filePath: string) =>
@@ -158,7 +167,7 @@ const api: EPiApi = {
     onProgress: (listener: (progress: PackageProgress) => void) => subscribe("packages:progress", listener),
   },
   models: {
-    list: () => ipcRenderer.invoke("models:list") as Promise<ModelManagementState>,
+    list: (cwd?: string) => ipcRenderer.invoke("models:list", cwd) as Promise<ModelManagementState>,
     login: (request: ModelLoginRequest) => ipcRenderer.invoke("models:login", request) as Promise<ModelManagementState>,
     respondToLogin: (response: ModelLoginResponse) => ipcRenderer.send("models:login-response", response),
     cancelLogin: () => ipcRenderer.send("models:cancel-login"),
@@ -202,6 +211,17 @@ const api: EPiApi = {
     remove: (request: SkillMutation) => ipcRenderer.invoke("skills:remove", request) as Promise<SkillRecord[]>,
     setEnabled: (request: SkillSetEnabledRequest) =>
       ipcRenderer.invoke("skills:set-enabled", request) as Promise<SkillRecord[]>,
+  },
+  automations: {
+    list: () => ipcRenderer.invoke("automations:list") as Promise<AutomationState>,
+    save: (request: AutomationSaveRequest) =>
+      ipcRenderer.invoke("automations:save", request) as Promise<AutomationState>,
+    setEnabled: (id: string, enabled: boolean) =>
+      ipcRenderer.invoke("automations:set-enabled", id, enabled) as Promise<AutomationState>,
+    remove: (id: string) => ipcRenderer.invoke("automations:remove", id) as Promise<AutomationState>,
+    runNow: (id: string) => ipcRenderer.invoke("automations:run-now", id) as Promise<AutomationState>,
+    stop: (runId: string) => ipcRenderer.invoke("automations:stop", runId) as Promise<AutomationState>,
+    onUpdated: (listener) => subscribe("automations:updated", listener),
   },
   git: {
     status: (cwd: string) => ipcRenderer.invoke("git:status", cwd) as Promise<GitStatus>,
@@ -247,7 +267,9 @@ const api: EPiApi = {
   },
   sideTerminal: {
     spawn: (cwd: string) => ipcRenderer.invoke("side-terminal:spawn", cwd) as Promise<string>,
+    status: (id: string) => ipcRenderer.invoke("side-terminal:status", id) as Promise<SideTerminalStatus | undefined>,
     write: (id: string, data: string) => ipcRenderer.send("side-terminal:write", id, data),
+    setEditorMode: (id: string, active: boolean) => ipcRenderer.send("side-terminal:editor-mode", id, active),
     resize: (id: string, size: ResizeTerminalRequest) => ipcRenderer.send("side-terminal:resize", id, size),
     kill: (id: string) => ipcRenderer.send("side-terminal:kill", id),
     onData: (listener: (id: string, data: string) => void) => {

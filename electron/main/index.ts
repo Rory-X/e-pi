@@ -1,12 +1,24 @@
 import { randomUUID } from "node:crypto";
 import { readFile, readdir, rm, writeFile } from "node:fs/promises";
-import { extname, join } from "node:path";
+import { basename, extname, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { app, BrowserWindow, clipboard, dialog, ipcMain, nativeImage, nativeTheme, shell } from "electron";
+import {
+  app,
+  BrowserWindow,
+  clipboard,
+  dialog,
+  ipcMain,
+  nativeImage,
+  nativeTheme,
+  powerMonitor,
+  shell,
+} from "electron";
 
 import type {
+  AutomationSaveRequest,
   AgentConfigSaveRequest,
+  AppInfo,
   CreateProjectRequest,
   CreateSessionRequest,
   CustomProviderRemoveRequest,
@@ -29,7 +41,15 @@ import type {
 import { ensureNpmOnPath } from "./npm-path";
 import { getAgentConfig, saveAgentConfig } from "./services/agent-config-service";
 import { appsForExtension, chooseAppFromSystem, listDevApps, openWithApp } from "./services/app-launch-service";
-import { getAppSettings, resolveDefaultCwd, setDefaultCwd, setOpenWithApp } from "./services/app-settings-service";
+import {
+  getAppSettings,
+  resolveDefaultCwd,
+  setDefaultCwd,
+  setOpenWithApp,
+  setTuiOptimizationsEnabled,
+} from "./services/app-settings-service";
+import { createAutomationExecutor } from "./services/automation-executor";
+import { AutomationService } from "./services/automation-service";
 import { CommandService } from "./services/command-service";
 import { debugLog, resetDebugLog } from "./services/debug-log";
 import { FileService } from "./services/file-service";
@@ -37,6 +57,8 @@ import { GitService } from "./services/git-service";
 import { ModelService } from "./services/model-service";
 import { TaskNotificationService } from "./services/notification-service";
 import { PackageService } from "./services/package-service";
+import { piPackageDir } from "./services/pi-agent-loader";
+import { applyPiCompatibilityPatches } from "./services/pi-compatibility-service";
 import { PiRuntime } from "./services/pi-runtime";
 import { getPiTuiSettings, savePiTuiSettings } from "./services/pi-settings-service";
 import { applyPiUpdate, checkPiUpdate, readInstalledPiVersion } from "./services/pi-update-service";
@@ -103,51 +125,69 @@ function isImage(path: string): boolean {
   return extname(path).toLowerCase() in IMAGE_MIME;
 }
 
+async function readAppInfo(): Promise<AppInfo> {
+  const settings = await getAppSettings();
+  return {
+    platform: process.platform,
+    arch: process.arch,
+    appVersion: app.getVersion(),
+    piVersion: readInstalledPiVersion(),
+    defaultCwd: await resolveDefaultCwd(),
+    homeDir: app.getPath("home"),
+    openWithApp: settings.openWithApp,
+    tuiOptimizationsEnabled: settings.tuiOptimizationsEnabled,
+  };
+}
+
 function registerHandlers(): void {
-  ipcMain.handle("app:get-info", async () => {
-    const settings = await getAppSettings();
-    return {
-      platform: process.platform,
-      arch: process.arch,
-      appVersion: app.getVersion(),
-      // Always read from disk so an in-place pi update shows the new version.
-      piVersion: readInstalledPiVersion(),
-      defaultCwd: await resolveDefaultCwd(),
-      homeDir: app.getPath("home"),
-      openWithApp: settings.openWithApp,
-    };
-  });
+  // Always read Pi's version from disk so an in-place update is reflected.
+  ipcMain.handle("app:get-info", () => readAppInfo());
 
   ipcMain.handle("app:set-default-cwd", async (_event, cwd: string) => {
     await setDefaultCwd(cwd);
-    const settings = await getAppSettings();
-    return {
-      platform: process.platform,
-      arch: process.arch,
-      appVersion: app.getVersion(),
-      piVersion: readInstalledPiVersion(),
-      defaultCwd: await resolveDefaultCwd(),
-      openWithApp: settings.openWithApp,
-    };
+    return readAppInfo();
   });
 
   ipcMain.handle("app:set-open-with-app", async (_event, appPath: string | undefined) => {
     await setOpenWithApp(appPath || undefined);
-    const settings = await getAppSettings();
-    return {
-      platform: process.platform,
-      arch: process.arch,
-      appVersion: app.getVersion(),
-      piVersion: readInstalledPiVersion(),
-      defaultCwd: await resolveDefaultCwd(),
-      openWithApp: settings.openWithApp,
-    };
+    return readAppInfo();
+  });
+
+  ipcMain.handle("app:set-tui-optimizations", async (_event, enabled: boolean) => {
+    const current = await getAppSettings();
+    if (current.tuiOptimizationsEnabled === enabled) return readAppInfo();
+
+    // Enabling is transactional: prove the currently selected Pi package can
+    // accept the patch before persisting the setting or restarting sessions.
+    if (enabled) {
+      try {
+        applyPiCompatibilityPatches(piPackageDir());
+      } catch (cause) {
+        throw new Error("The installed Pi version is not compatible with E-Pi's TUI optimization patch.", { cause });
+      }
+    }
+    await setTuiOptimizationsEnabled(enabled);
+    try {
+      await runtime.reloadAll();
+    } catch (cause) {
+      // Keep the persisted mode and the renderer switch truthful if a live
+      // session cannot restart. The package may remain patched, but the env
+      // gate restores stock behavior while the setting is off.
+      await setTuiOptimizationsEnabled(current.tuiOptimizationsEnabled);
+      try {
+        await runtime.reloadAll();
+      } catch {
+        // Preserve the original restart failure for the settings UI.
+      }
+      throw new Error("Could not restart Pi sessions; the previous TUI optimization mode was restored.", { cause });
+    }
+    return readAppInfo();
   });
 
   // Development-oriented macOS apps for the file tree's "open with" menus.
   ipcMain.handle("apps:list", async () => (process.platform === "darwin" ? listDevApps() : []));
 
-  // Apps declared to open the given file extension (fallback: dev apps).
+  // Apps ranked for the given file extension (Open With). Empty on non-macOS.
   ipcMain.handle("apps:for-extension", async (_event, extension: string) =>
     process.platform === "darwin" ? appsForExtension(extension) : [],
   );
@@ -166,8 +206,18 @@ function registerHandlers(): void {
   // the new version. Fails without touching the install when no update exists
   // or any step (download/extract/install/swap) errors. Session restarts are
   // best-effort: a restart failure must not report the update itself as failed.
-  ipcMain.handle("app:apply-pi-update", async () => {
-    const result = await applyPiUpdate();
+  ipcMain.handle("app:apply-pi-update", async (_event, options?: { allowStockFallback?: boolean }) => {
+    const settings = await getAppSettings();
+    const result = await applyPiUpdate({
+      tuiOptimizationsEnabled: settings.tuiOptimizationsEnabled,
+      allowStockFallback: options?.allowStockFallback === true,
+    });
+    if (result.fallbackToStock && settings.tuiOptimizationsEnabled) {
+      // A stock package cannot satisfy the enabled-mode compatibility probes.
+      // Persist stock mode before restarting sessions so the new package is
+      // immediately loadable and the UI truthfully waits for a future patch.
+      await setTuiOptimizationsEnabled(false);
+    }
     try {
       await runtime.reloadAll();
     } catch (reason) {
@@ -216,6 +266,32 @@ function registerHandlers(): void {
   ipcMain.handle("app:open-path", async (_event, path: string) => {
     const error = await shell.openPath(path);
     if (error) throw new Error(error);
+  });
+
+  // Write a file into the OS temp dir (e.g. an exported diagram); returns
+  // the absolute path so the caller can open it. base64=true decodes the
+  // content as binary (PNG exports).
+  ipcMain.handle("app:write-temp-file", async (_event, fileName: string, content: string, base64?: boolean) => {
+    const target = join(app.getPath("temp"), basename(fileName));
+    if (base64) await writeFile(target, Buffer.from(content, "base64"));
+    else await writeFile(target, content, "utf8");
+    return target;
+  });
+
+  // Delete a temp file the renderer no longer needs. The check is hardened
+  // against traversal (`..`) and platform path separators: the path is
+  // resolved, must stay inside the temp dir, and must be one of our own
+  // exported temp files (mermaid-* prefix) — a compromised renderer can
+  // never delete arbitrary files.
+  ipcMain.handle("app:remove-temp-file", async (_event, path: string) => {
+    const tempDir = app.getPath("temp");
+    const resolved = resolve(path);
+    const relativeToTemp = relative(tempDir, resolved);
+    const insideTemp = !relativeToTemp.startsWith("..") && !isAbsolute(relativeToTemp);
+    if (!insideTemp || !basename(resolved).startsWith("mermaid-")) {
+      throw new Error("Refusing to remove file outside the temp dir");
+    }
+    await rm(resolved, { force: true });
   });
 
   // Reveal the item in Finder (macOS) / Explorer (Windows) / the file manager (Linux).
@@ -288,7 +364,10 @@ function registerHandlers(): void {
     return `data:${mime};base64,${data}`;
   });
 
-  ipcMain.handle("sessions:list", () => sessions.list());
+  ipcMain.handle("sessions:list", async () => {
+    await automations.list().catch((error) => debugLog("[automations] load failed", String(error)));
+    return automations.decorateSessions(await sessions.list());
+  });
   ipcMain.handle("sessions:create", async (_event, request: CreateSessionRequest) => {
     return sessions.create(request.cwd?.trim() || activeCwd());
   });
@@ -353,6 +432,15 @@ function registerHandlers(): void {
   ipcMain.handle("commands:argument-completions", (_event, cwd: string, command: string, argumentPrefix: string) =>
     commands.argumentCompletions(cwd || activeCwd(), command, argumentPrefix),
   );
+
+  ipcMain.handle("automations:list", () => automations.list());
+  ipcMain.handle("automations:save", (_event, request: AutomationSaveRequest) => automations.save(request));
+  ipcMain.handle("automations:set-enabled", (_event, id: string, enabled: boolean) =>
+    automations.setEnabled(id, enabled),
+  );
+  ipcMain.handle("automations:remove", (_event, id: string) => automations.remove(id));
+  ipcMain.handle("automations:run-now", (_event, id: string) => automations.runNow(id));
+  ipcMain.handle("automations:stop", (_event, runId: string) => automations.stop(runId));
 
   ipcMain.handle("skills:list", (_event, cwd: string) => skills.list(cwd || activeCwd()));
   ipcMain.handle("skills:read", (_event, cwd: string, filePath: string) => skills.read(cwd || activeCwd(), filePath));
@@ -422,14 +510,18 @@ function registerHandlers(): void {
   workspaceWatcher.onChanged((event) => sendToRenderer("workspace:changed", event));
 
   ipcMain.handle("side-terminal:spawn", async (_event, cwd: string) => sideTerminals.spawn(cwd || activeCwd()));
+  ipcMain.handle("side-terminal:status", async (_event, id: string) => sideTerminals.getStatus(id));
   ipcMain.on("side-terminal:write", (_event, id: string, data: string) => sideTerminals.write(id, data));
+  ipcMain.on("side-terminal:editor-mode", (_event, id: string, active: boolean) =>
+    sideTerminals.setEditorMode(id, active),
+  );
   ipcMain.on("side-terminal:resize", (_event, id: string, size: ResizeTerminalRequest) =>
     sideTerminals.resize(id, size.cols, size.rows),
   );
   ipcMain.on("side-terminal:kill", (_event, id: string) => sideTerminals.kill(id));
   sideTerminals.onData((id, data) => sendToRenderer("side-terminal:data", { id, data }));
 
-  ipcMain.handle("models:list", () => models.list(activeCwd()));
+  ipcMain.handle("models:list", (_event, cwd?: string) => models.list(cwd || activeCwd()));
   ipcMain.handle("models:login", async (_event, request: ModelLoginRequest) => {
     const state = await models.login(request, activeCwd(), (loginEvent) => {
       sendToRenderer("models:login-event", loginEvent);
@@ -458,10 +550,16 @@ function registerHandlers(): void {
     return state;
   });
   ipcMain.handle("models:custom-list", () => models.listCustomProviders());
-  ipcMain.handle("models:custom-save", (_event, request: CustomProviderRequest) => models.saveCustomProvider(request));
-  ipcMain.handle("models:custom-remove", (_event, request: CustomProviderRemoveRequest) =>
-    models.removeCustomProvider(request),
-  );
+  ipcMain.handle("models:custom-save", async (_event, request: CustomProviderRequest) => {
+    const list = await models.saveCustomProvider(request);
+    await reloadActiveRuntime();
+    return list;
+  });
+  ipcMain.handle("models:custom-remove", async (_event, request: CustomProviderRemoveRequest) => {
+    const list = await models.removeCustomProvider(request);
+    await reloadActiveRuntime();
+    return list;
+  });
   ipcMain.handle("models:fetch-models", (_event, request: FetchModelsRequest) => models.fetchModels(request));
   ipcMain.handle("models:catalog-meta", (_event, request: CatalogMetaRequest) => models.catalogMeta(request));
 
@@ -569,7 +667,7 @@ runtime.onSessionFileChanged(() => {
     sessionListRefreshTimer = undefined;
     void sessions
       .list()
-      .then((next) => sendToRenderer("sessions:updated", next))
+      .then((next) => sendToRenderer("sessions:updated", automations.decorateSessions(next)))
       .catch(() => undefined);
   }, 300);
 });
@@ -582,13 +680,15 @@ projects.onUpdated((next) => sendToRenderer("projects:updated", next));
 let notificationHintShown = false;
 const notifications = new TaskNotificationService(
   (sessionPath) => {
-    if (!mainWindow) return;
-    if (mainWindow.isMinimized()) mainWindow.restore();
-    mainWindow.show();
-    mainWindow.focus();
-    // Ask the renderer to open this session so the banner click lands on
-    // the conversation that finished.
-    sendToRenderer("notifications:open-session", sessionPath);
+    if (!mainWindow) createWindow();
+    const window = mainWindow;
+    if (!window) return;
+    if (window.isMinimized()) window.restore();
+    window.show();
+    window.focus();
+    const open = () => sendToRenderer("notifications:open-session", sessionPath);
+    if (window.webContents.isLoadingMainFrame()) window.webContents.once("did-finish-load", open);
+    else open();
   },
   () => {
     // macOS refuses banners without notification permission and never asks
@@ -613,6 +713,8 @@ const notifications = new TaskNotificationService(
   },
 );
 runtime.onState((state) => {
+  void automations.observe(state).catch((error) => debugLog("[automations] observe failed", String(error)));
+  if (automations.ownsSession(state.sessionPath)) return;
   notifications.observe(state, {
     activeSessionPath: runtime.activeSessionPath,
     windowFocused: mainWindow?.isFocused() ?? false,
@@ -626,6 +728,34 @@ packages.setProgressListener((progress) => sendToRenderer("packages:progress", p
 if (!app.isPackaged) {
   app.setPath("userData", app.getPath("userData") + "-dev");
 }
+
+const automations = new AutomationService(
+  join(app.getPath("userData"), "automations.json"),
+  createAutomationExecutor({
+    runtime,
+    sessions,
+    models,
+    skills,
+    sessionsChanged: async () =>
+      sendToRenderer("sessions:updated", automations.decorateSessions(await sessions.list())),
+    notify: (run) => {
+      const body =
+        run.status === "waiting"
+          ? "Automation needs your input"
+          : run.status === "success"
+            ? "Automation completed"
+            : run.status === "timed_out"
+              ? "Automation timed out"
+              : "Automation failed";
+      void notifications.notify(
+        { status: "idle", generation: 0, sessionPath: run.sessionPath ?? "", cwd: run.cwd },
+        body,
+        { detail: `${run.taskName}${run.detail ? `: ${run.detail}` : ""}` },
+      );
+    },
+  }),
+);
+automations.onUpdated((state) => sendToRenderer("automations:updated", state));
 
 const hasLock = app.requestSingleInstanceLock();
 if (!hasLock) {
@@ -650,15 +780,31 @@ if (!hasLock) {
     registerHandlers();
     void cleanupStalePastedImages();
     createWindow();
+    void automations.start().catch((error) => {
+      debugLog("[automations] initialization failed", String(error));
+      sendToRenderer("automations:updated", { tasks: [], runs: [], error: String(error) });
+    });
+    powerMonitor.on("suspend", () => automations.suspend());
+    powerMonitor.on("resume", () => {
+      void automations.resume().catch(() => undefined);
+    });
     app.on("activate", () => {
       if (BrowserWindow.getAllWindows().length === 0) createWindow();
     });
   });
 
-  app.on("before-quit", () => {
-    void runtime.stop();
+  let quitting = false;
+  app.on("before-quit", (event) => {
+    if (quitting) return;
+    event.preventDefault();
+    quitting = true;
     sideTerminals.killAll();
     workspaceWatcher.dispose();
+    void automations
+      .shutdown()
+      .catch((error) => debugLog("[automations] shutdown failed", String(error)))
+      .then(() => runtime.stop())
+      .finally(() => app.quit());
   });
 
   app.on("window-all-closed", () => {
