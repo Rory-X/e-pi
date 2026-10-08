@@ -1,6 +1,8 @@
 import { contextBridge, ipcRenderer, webUtils } from "electron";
 
 import type {
+  AutomationSaveRequest,
+  AutomationState,
   ArchivedSessionSummary,
   AgentConfigSaveRequest,
   AppDescriptor,
@@ -165,7 +167,7 @@ const api: EPiApi = {
     onProgress: (listener: (progress: PackageProgress) => void) => subscribe("packages:progress", listener),
   },
   models: {
-    list: () => ipcRenderer.invoke("models:list") as Promise<ModelManagementState>,
+    list: (cwd?: string) => ipcRenderer.invoke("models:list", cwd) as Promise<ModelManagementState>,
     login: (request: ModelLoginRequest) => ipcRenderer.invoke("models:login", request) as Promise<ModelManagementState>,
     respondToLogin: (response: ModelLoginResponse) => ipcRenderer.send("models:login-response", response),
     cancelLogin: () => ipcRenderer.send("models:cancel-login"),
@@ -209,6 +211,17 @@ const api: EPiApi = {
     remove: (request: SkillMutation) => ipcRenderer.invoke("skills:remove", request) as Promise<SkillRecord[]>,
     setEnabled: (request: SkillSetEnabledRequest) =>
       ipcRenderer.invoke("skills:set-enabled", request) as Promise<SkillRecord[]>,
+  },
+  automations: {
+    list: () => ipcRenderer.invoke("automations:list") as Promise<AutomationState>,
+    save: (request: AutomationSaveRequest) =>
+      ipcRenderer.invoke("automations:save", request) as Promise<AutomationState>,
+    setEnabled: (id: string, enabled: boolean) =>
+      ipcRenderer.invoke("automations:set-enabled", id, enabled) as Promise<AutomationState>,
+    remove: (id: string) => ipcRenderer.invoke("automations:remove", id) as Promise<AutomationState>,
+    runNow: (id: string) => ipcRenderer.invoke("automations:run-now", id) as Promise<AutomationState>,
+    stop: (runId: string) => ipcRenderer.invoke("automations:stop", runId) as Promise<AutomationState>,
+    onUpdated: (listener) => subscribe("automations:updated", listener),
   },
   git: {
     status: (cwd: string) => ipcRenderer.invoke("git:status", cwd) as Promise<GitStatus>,

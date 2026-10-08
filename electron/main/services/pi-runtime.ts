@@ -13,6 +13,7 @@ import type {
   ModelRef,
   PiActivityStatus,
   PiRuntimeState,
+  PiTurnResult,
   ResizeTerminalRequest,
   SessionUsageState,
   WaitingUserState,
@@ -126,7 +127,15 @@ function isRecord(value: unknown): value is Record<string, unknown> {
  * independent: switching the visible session never stops another session's
  * process, so agent runs continue in the background.
  */
+export interface RuntimeLaunchOptions {
+  background?: boolean;
+  signal?: AbortSignal;
+  model?: ModelRef;
+  thinkingLevel?: Exclude<AgentThinkingLevel, "">;
+}
+
 interface Instance {
+  launchOptions?: RuntimeLaunchOptions;
   sessionPath: string;
   cwd: string;
   generation: number;
@@ -251,10 +260,10 @@ export class PiRuntime {
     return () => this.#sessionFileListeners.delete(listener);
   }
 
-  async start(sessionPath: string, cwd: string): Promise<void> {
+  async start(sessionPath: string, cwd: string, options: RuntimeLaunchOptions = {}): Promise<void> {
     debugLog("[runtime] start() begin", { sessionPath, cwd });
-    this.#activeSessionPath = sessionPath;
-    await this.#chain(sessionPath, () => this.#ensureRunning(sessionPath, cwd));
+    if (!options.background) this.#activeSessionPath = sessionPath;
+    await this.#chain(sessionPath, () => this.#ensureRunning(sessionPath, cwd, options));
     debugLog("[runtime] start() done", { sessionPath });
   }
 
@@ -366,7 +375,7 @@ export class PiRuntime {
     return run;
   }
 
-  async #ensureRunning(sessionPath: string, cwd: string): Promise<void> {
+  async #ensureRunning(sessionPath: string, cwd: string, options: RuntimeLaunchOptions): Promise<void> {
     // Sessions launched from now on must start with the app's theme variant:
     // pi reads the auto theme setting ("dark/e-pi-light") plus COLORFGBG at
     // startup; the contrast-fixed light theme file must exist for pi to
@@ -380,6 +389,7 @@ export class PiRuntime {
     }
     // A placeholder may not know the session's real cwd yet; the caller does.
     instance.cwd = cwd;
+    if (options.model) instance.launchOptions = { model: options.model, thinkingLevel: options.thinkingLevel };
     if (
       instance.process !== undefined &&
       (instance.state.status === "running" ||
@@ -390,10 +400,10 @@ export class PiRuntime {
       // will relaunch after stop completes).
       return;
     }
-    await this.#launch(instance);
+    await this.#launch(instance, options.signal);
   }
 
-  async #launch(instance: Instance): Promise<void> {
+  async #launch(instance: Instance, abortSignal?: AbortSignal): Promise<void> {
     const { sessionPath, cwd } = instance;
     const launchT0 = performance.now();
     const launchMark = (label: string): void => {
@@ -432,8 +442,13 @@ export class PiRuntime {
       }
       // E-Pi-managed Pi Agent settings (system prompt, thinking level, context
       // files). Re-read on every launch so `reloadAll` picks up saved changes.
-      const agentArgs = agentConfigToArgs(await getAgentConfig());
+      const agentConfig = await getAgentConfig();
+      if (instance.launchOptions?.thinkingLevel) agentConfig.thinkingLevel = instance.launchOptions.thinkingLevel;
+      const agentArgs = agentConfigToArgs(agentConfig);
       args.push(...agentArgs);
+      if (instance.launchOptions?.model) {
+        args.push("--provider", instance.launchOptions.model.provider, "--model", instance.launchOptions.model.id);
+      }
       debugLog("[runtime] spawning pi", { nodeBinary, args, cwd, sessionPath });
       launchMark("config resolved");
 
@@ -539,7 +554,7 @@ export class PiRuntime {
       });
 
       this.#watchActivity(instance);
-      await this.#waitUntilReady(instance, child);
+      await this.#waitUntilReady(instance, child, abortSignal);
       launchMark("ready (activity sidecar)");
       this.#setState(instance, {
         ...instance.state,
@@ -570,13 +585,18 @@ export class PiRuntime {
     }
   }
 
-  async #waitUntilReady(instance: Instance, child: IPty): Promise<void> {
+  async #waitUntilReady(instance: Instance, child: IPty, signal?: AbortSignal): Promise<void> {
     const activityPath = join(dirname(instance.sessionPath), `${basename(instance.sessionPath)}${ACTIVITY_SUFFIX}`);
     await new Promise<void>((resolve, reject) => {
       let reading = false;
       let timeout: NodeJS.Timeout | undefined;
       let stopOutput: { dispose: () => void } | undefined;
+      let finished = false;
+      const abort = () => finish(new Error("Pi launch was cancelled."));
       const finish = (error?: Error): void => {
+        if (finished) return;
+        finished = true;
+        signal?.removeEventListener("abort", abort);
         stopOutput?.dispose();
         clearInterval(interval);
         if (timeout) clearTimeout(timeout);
@@ -592,8 +612,22 @@ export class PiRuntime {
         reading = true;
         void readFile(activityPath, "utf8")
           .then((raw) => {
-            const status = (JSON.parse(raw) as { status?: unknown }).status;
-            if (status === "busy" || status === "idle") finish();
+            if (finished) return;
+            const parsed = JSON.parse(raw) as { status?: unknown; model?: ModelRef; thinkingLevel?: string };
+            if (parsed.status === "busy" || parsed.status === "idle") {
+              this.#setState(instance, {
+                ...instance.state,
+                activity: parsed.status,
+                model:
+                  typeof parsed.model?.provider === "string" && typeof parsed.model.id === "string"
+                    ? parsed.model
+                    : instance.state.model,
+                thinkingLevel: THINKING_LEVELS.includes(parsed.thinkingLevel as Exclude<AgentThinkingLevel, "">)
+                  ? (parsed.thinkingLevel as Exclude<AgentThinkingLevel, "">)
+                  : instance.state.thinkingLevel,
+              });
+              finish();
+            }
           })
           .catch(() => undefined)
           .finally(() => {
@@ -611,7 +645,9 @@ export class PiRuntime {
         timeout = setTimeout(() => finish(new Error("Pi terminal did not become ready in time.")), READY_TIMEOUT_MS);
       });
       timeout = setTimeout(() => finish(new Error("Pi terminal did not become ready in time.")), READY_TIMEOUT_MS);
-      check();
+      signal?.addEventListener("abort", abort, { once: true });
+      if (signal?.aborted) abort();
+      else check();
     });
     debugLog("[runtime] terminal ready", { sessionPath: instance.sessionPath, pid: child.pid });
   }
@@ -645,6 +681,7 @@ export class PiRuntime {
             cacheHitRate?: unknown;
             speed?: unknown;
             waitingUser?: unknown;
+            turnResult?: unknown;
           };
           const activity =
             parsed.status === "busy" || parsed.status === "idle" ? (parsed.status as PiActivityStatus) : undefined;
@@ -703,7 +740,21 @@ export class PiRuntime {
                     detail: typeof rawWaiting.detail === "string" ? rawWaiting.detail : undefined,
                   }
                 : (instance.state.waitingUser ?? undefined);
+          const rawResult = parsed.turnResult;
+          const turnResult: PiTurnResult | null | undefined =
+            rawResult === null
+              ? null
+              : isRecord(rawResult) &&
+                  typeof rawResult.serial === "number" &&
+                  (rawResult.status === "success" || rawResult.status === "error" || rawResult.status === "cancelled")
+                ? {
+                    serial: rawResult.serial,
+                    status: rawResult.status,
+                    error: typeof rawResult.error === "string" ? rawResult.error : undefined,
+                  }
+                : instance.state.turnResult;
           const signature = JSON.stringify({
+            turnResult,
             activity,
             model,
             thinkingLevel,
@@ -715,6 +766,7 @@ export class PiRuntime {
             waitingUser,
           });
           const previous = JSON.stringify({
+            turnResult: instance.state.turnResult,
             activity: instance.state.activity,
             model: instance.state.model,
             thinkingLevel: instance.state.thinkingLevel,
@@ -731,6 +783,7 @@ export class PiRuntime {
             this.#setState(instance, {
               ...instance.state,
               activity,
+              turnResult,
               model: model ?? instance.state.model,
               thinkingLevel: thinkingLevel ?? instance.state.thinkingLevel,
               supportedThinkingLevels: supportedThinkingLevels ?? instance.state.supportedThinkingLevels,

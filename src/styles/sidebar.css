@@ -113,9 +113,7 @@
 }
 
 .sidebar-session-group {
-  min-height: 0;
-  flex: 1;
-  overflow: hidden;
+  flex: 0 0 auto;
 }
 
 .sidebar-session-group .sidebar-group-label {
@@ -159,14 +157,18 @@
   box-shadow: 0 0 0 2px var(--sidebar-ring);
 }
 
-.sidebar-session-group .sidebar-group-content {
+.sidebar-content {
+  display: flex;
+  min-width: 0;
   min-height: 0;
   flex: 1;
-  overflow-x: hidden;
-  overflow-y: auto;
+  flex-direction: column;
+  overflow: hidden;
 }
 
-.sidebar-content {
+/* Pinned and PROJECTS share this one scroller. Skills / Packages / New
+   session stay above it; Settings stays in the footer. */
+.sidebar-list-scroll {
   display: flex;
   min-width: 0;
   min-height: 0;
@@ -450,17 +452,13 @@
   background: var(--sidebar-accent);
 }
 
-/* Pinned sessions float above the project groups. */
+/* Pinned sessions sit above the project groups, inside the shared list scroller. */
 .pinned-sessions {
   /* 8px left padding replaces .sidebar-group's side padding: this block
      renders outside the group, and its label/rows must align with RECENT. */
   margin: 2px 0 0;
   padding: 0 0 4px 8px;
   flex: 0 0 auto;
-  min-height: 0;
-  /* A drag-resized section scrolls internally, so a long pinned list can
-     never squeeze the PROJECTS group out of the sidebar. */
-  overflow-y: auto;
 }
 
 .pinned-sessions-label {
@@ -495,44 +493,7 @@
   transform: rotate(-90deg);
 }
 
-/* Drag handle under the PINNED section: dragging caps the pinned area so
-   PROJECTS keeps room (the section's own scrollbar takes over). The ::after
-   line is the visual divider between PINNED and PROJECTS. */
-.pinned-resize-handle {
-  position: relative;
-  flex: 0 0 auto;
-  height: 10px;
-  margin: 0 8px;
-  cursor: ns-resize;
-  touch-action: none;
-}
-
-.pinned-resize-handle::after {
-  content: "";
-  position: absolute;
-  top: 4px;
-  left: 0;
-  right: 0;
-  height: 2px;
-  border-radius: 1px;
-  background: var(--border);
-  transition:
-    height 120ms ease,
-    background-color 120ms ease;
-}
-
-.pinned-resize-handle:hover::after,
-.pinned-resize-handle:focus-visible::after {
-  height: 4px;
-  background: var(--sidebar-ring);
-}
-
-body.pinned-section-resizing {
-  cursor: ns-resize;
-  user-select: none;
-}
-
-/* Default-folder sessions, listed flat above the project groups. The top
+/* Default-folder sessions, listed flat under the project groups. The top
    border separates RECENT from the workspace groups above it. */
 .sidebar-recent {
   margin-top: 4px;

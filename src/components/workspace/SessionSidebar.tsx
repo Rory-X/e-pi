@@ -1,4 +1,4 @@
-import { BadgePlus, ChevronDown, Moon, Package, Pin, Plus, Settings2, Sparkles, Sun } from "lucide-react";
+import { BadgePlus, Clock3, ChevronDown, Moon, Package, Pin, Plus, Settings2, Sparkles, Sun } from "lucide-react";
 import { memo, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
 
@@ -35,27 +35,8 @@ import {
   type SessionRowCallbacks,
 } from "./sidebar/shared";
 
-/** Drag-resized max-height of the expanded PINNED section (px). */
-const PINNED_HEIGHT_KEY = "sidebar-pinned-height-v1";
-/** sessionOrderRef key for the default-folder "Recent" flat list. */
+/** SessionOrderRef key for the default-folder "Recent" flat list. */
 const RECENT_ORDER_KEY = "__recent__";
-/** Smallest the PINNED section can be dragged to (label + one row). */
-const PINNED_SECTION_MIN = 32;
-/** Space (px) the PROJECTS group keeps when the pinned section is resized. */
-const PROJECTS_MIN_SPACE = 110;
-
-function readPinnedSectionHeight(): number | undefined {
-  try {
-    const saved = window.localStorage.getItem(PINNED_HEIGHT_KEY);
-    if (saved !== null) {
-      const parsed = Number(saved);
-      if (Number.isFinite(parsed) && parsed >= PINNED_SECTION_MIN) return parsed;
-    }
-  } catch {
-    // Storage unavailable — use the natural height.
-  }
-  return undefined;
-}
 
 interface SessionSidebarProps {
   sessions: SessionSummary[];
@@ -84,6 +65,7 @@ interface SessionSidebarProps {
   onCopyText: (text: string) => void;
   onOpenPackages: () => void;
   onOpenSkills: () => void;
+  onOpenAutomations: () => void;
   onOpenSettings: () => void;
 }
 
@@ -107,6 +89,7 @@ export const SessionSidebar = memo(function SessionSidebar({
   onCopyText,
   onOpenPackages,
   onOpenSkills,
+  onOpenAutomations,
   onOpenSettings,
 }: SessionSidebarProps) {
   const [collapsed, setCollapsed] = useState<ReadonlySet<string>>(new Set());
@@ -271,9 +254,11 @@ export const SessionSidebar = memo(function SessionSidebar({
     [orderedProjects, pinnedProjects],
   );
 
-  /** Default-folder sessions, listed flat under "Recent". Same frozen-order
+  /**
+   * Default-folder sessions, listed flat under "Recent". Same frozen-order
    * rule as project groups: new sessions go to the top, existing ones keep
-   * their position (recency order reshuffles under the cursor). */
+   * their position (recency order reshuffles under the cursor).
+   */
   const recentSessions = useMemo(() => {
     const list = homeCwd ? sessions.filter((session) => session.cwd === homeCwd) : [];
     return freezeSessionOrder(RECENT_ORDER_KEY, list);
@@ -303,53 +288,6 @@ export const SessionSidebar = memo(function SessionSidebar({
   };
 
   const isCollapsed = (cwd: string) => collapsed.has(cwd);
-
-  /**
-   * Drag-resized max-height (px) of the expanded PINNED section; undefined
-   * means the section grows naturally and the sidebar scrolls as a whole.
-   */
-  const [pinnedMaxHeight, setPinnedMaxHeight] = useState<number | undefined>(readPinnedSectionHeight);
-  const pinnedSectionRef = useRef<HTMLDivElement>(null);
-
-  const persistPinnedHeight = (height: number) => {
-    setPinnedMaxHeight(height);
-    try {
-      window.localStorage.setItem(PINNED_HEIGHT_KEY, String(height));
-    } catch {
-      // Storage unavailable — the resize just won't survive a restart.
-    }
-  };
-
-  /**
-   * Drag the divider under PINNED to cap the section's height: a long pinned
-   * list then scrolls inside the section instead of squeezing PROJECTS out.
-   */
-  const onPinnedResizeStart = (event: React.PointerEvent<HTMLDivElement>) => {
-    const section = pinnedSectionRef.current;
-    const container = section?.parentElement;
-    if (!section || !container) return;
-    event.preventDefault();
-    const handle = event.currentTarget;
-    handle.setPointerCapture(event.pointerId);
-    const startY = event.clientY;
-    const startHeight = pinnedMaxHeight ?? section.clientHeight;
-    const maxAllowed = Math.max(PINNED_SECTION_MIN, container.clientHeight - PROJECTS_MIN_SPACE);
-    const clampHeight = (clientY: number) =>
-      Math.min(maxAllowed, Math.max(PINNED_SECTION_MIN, startHeight + (clientY - startY)));
-    const onMove = (moveEvent: PointerEvent) => {
-      section.style.maxHeight = `${clampHeight(moveEvent.clientY)}px`;
-    };
-    const onUp = (upEvent: PointerEvent) => {
-      window.removeEventListener("pointermove", onMove);
-      window.removeEventListener("pointerup", onUp);
-      document.body.classList.remove("pinned-section-resizing");
-      section.style.maxHeight = "";
-      persistPinnedHeight(clampHeight(upEvent.clientY));
-    };
-    document.body.classList.add("pinned-section-resizing");
-    window.addEventListener("pointermove", onMove);
-    window.addEventListener("pointerup", onUp);
-  };
 
   /** Expand the sidebar and reveal one project's sessions (collapsed-mode click). */
   const expandToProject = (cwd: string) => {
@@ -467,6 +405,12 @@ export const SessionSidebar = memo(function SessionSidebar({
                 </SidebarMenuButton>
               </SidebarMenuItem>
               <SidebarMenuItem>
+                <SidebarMenuButton tooltip="Automations" onClick={onOpenAutomations}>
+                  <Clock3 />
+                  <span>Automations</span>
+                </SidebarMenuButton>
+              </SidebarMenuItem>
+              <SidebarMenuItem>
                 <SidebarMenuButton tooltip="Packages" onClick={onOpenPackages}>
                   <Package />
                   <span>Packages</span>
@@ -490,136 +434,63 @@ export const SessionSidebar = memo(function SessionSidebar({
           </SidebarGroupContent>
         </SidebarGroup>
 
-        {pinnedSessionList.length > 0 || pinnedProjectList.length > 0 ? (
-          state === "collapsed" ? (
-            // Icon-only pinned rows: one aggregated pin button for pinned
-            // chats and the project avatar flyout for pinned projects.
-            <SidebarMenu className="pinned-sessions-collapsed">
-              {pinnedSessionList.length > 0 ? (
-                <SidebarMenuItem>
-                  {/* One aggregated pin button; hovering (or clicking) lists
+        <div className="sidebar-list-scroll">
+          {pinnedSessionList.length > 0 || pinnedProjectList.length > 0 ? (
+            state === "collapsed" ? (
+              // Icon-only pinned rows: one aggregated pin button for pinned
+              // chats and the project avatar flyout for pinned projects.
+              <SidebarMenu className="pinned-sessions-collapsed">
+                {pinnedSessionList.length > 0 ? (
+                  <SidebarMenuItem>
+                    {/* One aggregated pin button; hovering (or clicking) lists
                           every pinned chat (same flyout pattern as collapsed
                           projects). */}
-                  <HoverCard open={pinnedFlyoutOpen} onOpenChange={setPinnedFlyoutOpen} openDelay={120} closeDelay={60}>
-                    <HoverCardTrigger asChild>
-                      <SidebarMenuButton
-                        className="pinned-collapsed-session"
-                        aria-label="Pinned chats"
-                        onClick={() => setPinnedFlyoutOpen((current) => !current)}
-                      >
-                        <Pin size={14} fill="currentColor" />
-                      </SidebarMenuButton>
-                    </HoverCardTrigger>
-                    <HoverCardContent side="right" sideOffset={10} align="start" className="project-flyout">
-                      <div className="project-flyout-header">
-                        <span className="project-flyout-title">
-                          Pinned chat{pinnedSessionList.length === 1 ? "" : "s"}
-                        </span>
-                      </div>
-                      <ul className="project-flyout-sessions">
-                        {pinnedSessionList.map((session) => (
-                          <SessionRow
-                            key={session.path}
-                            flyout
-                            session={session}
-                            active={session.path === activePath}
-                            runtime={runtimeStates?.[session.path]}
-                            pinned={pinnedSessions.has(session.path)}
-                            completedRun={unseenRuns.has(session.path)}
-                            platform={platform}
-                            labelClassName="project-flyout-session-label"
-                            {...sessionRowCallbacks}
-                            onSelect={(selected) => {
-                              setPinnedFlyoutOpen(false);
-                              onSelect(selected);
-                            }}
-                          />
-                        ))}
-                      </ul>
-                    </HoverCardContent>
-                  </HoverCard>
-                </SidebarMenuItem>
-              ) : null}
-              {pinnedProjectList.map((project) => (
-                <SidebarMenuItem key={project.key}>
-                  <ProjectFlyout
-                    project={project}
-                    label={projectLabel(project)}
-                    projectPinned={pinnedProjects.has(project.key)}
-                    onExpand={() => expandToProject(project.cwd)}
-                    {...flyoutProps}
-                  />
-                </SidebarMenuItem>
-              ))}
-            </SidebarMenu>
-          ) : (
-            <div
-              className="pinned-sessions"
-              ref={pinnedSectionRef}
-              style={pinnedMaxHeight !== undefined ? { maxHeight: pinnedMaxHeight } : undefined}
-            >
-              <button
-                type="button"
-                className={`pinned-sessions-label${pinnedCollapsed ? " collapsed" : ""}`}
-                onClick={() => setPinnedCollapsed((current) => !current)}
-                aria-expanded={!pinnedCollapsed}
-              >
-                <ChevronDown size={10} className="pinned-sessions-chevron" aria-hidden="true" />
-                Pinned
-              </button>
-              {pinnedCollapsed ? null : (
-                <>
-                  <SidebarMenu className="pinned-sessions-list">
-                    {pinnedSessionList.map((session) => renderSessionRow(session))}
-                  </SidebarMenu>
-                  {pinnedProjectList.map((project) => renderProjectRow(project))}
-                </>
-              )}
-            </div>
-          )
-        ) : null}
-
-        {state === "collapsed" ||
-        pinnedCollapsed ||
-        (pinnedSessionList.length === 0 && pinnedProjectList.length === 0) ? null : (
-          <div
-            className="pinned-resize-handle"
-            role="separator"
-            aria-orientation="horizontal"
-            aria-label="Resize Pinned section"
-            title="Drag to resize Pinned"
-            onPointerDown={onPinnedResizeStart}
-          />
-        )}
-
-        <SidebarGroup className="sidebar-session-group">
-          {state === "collapsed" ? null : (
-            <SidebarGroupLabel>
-              PROJECTS
-              <SidebarGroupAction aria-label="Add project" title="Add project" onClick={onImportProject}>
-                <Plus size={12} />
-              </SidebarGroupAction>
-            </SidebarGroupLabel>
-          )}
-
-          <SidebarGroupContent>
-            {state === "collapsed" ? (
-              <SidebarMenu>
-                {/* The default folder gets its own flyout entry ("Home") —
-                    its sessions live under Recent, not in a project group. */}
-                {homeProject ? (
-                  <SidebarMenuItem key={homeProject.key}>
-                    <ProjectFlyout
-                      project={homeProject}
-                      label={pathBaseName(homeProject.cwd)}
-                      onExpand={() => expandToProject(homeProject.cwd)}
-                      {...flyoutProps}
-                    />
+                    <HoverCard
+                      open={pinnedFlyoutOpen}
+                      onOpenChange={setPinnedFlyoutOpen}
+                      openDelay={120}
+                      closeDelay={60}
+                    >
+                      <HoverCardTrigger asChild>
+                        <SidebarMenuButton
+                          className="pinned-collapsed-session"
+                          aria-label="Pinned chats"
+                          onClick={() => setPinnedFlyoutOpen((current) => !current)}
+                        >
+                          <Pin size={14} fill="currentColor" />
+                        </SidebarMenuButton>
+                      </HoverCardTrigger>
+                      <HoverCardContent side="right" sideOffset={10} align="start" className="project-flyout">
+                        <div className="project-flyout-header">
+                          <span className="project-flyout-title">
+                            Pinned chat{pinnedSessionList.length === 1 ? "" : "s"}
+                          </span>
+                        </div>
+                        <ul className="project-flyout-sessions">
+                          {pinnedSessionList.map((session) => (
+                            <SessionRow
+                              key={session.path}
+                              flyout
+                              session={session}
+                              active={session.path === activePath}
+                              runtime={runtimeStates?.[session.path]}
+                              pinned={pinnedSessions.has(session.path)}
+                              completedRun={unseenRuns.has(session.path)}
+                              platform={platform}
+                              labelClassName="project-flyout-session-label"
+                              {...sessionRowCallbacks}
+                              onSelect={(selected) => {
+                                setPinnedFlyoutOpen(false);
+                                onSelect(selected);
+                              }}
+                            />
+                          ))}
+                        </ul>
+                      </HoverCardContent>
+                    </HoverCard>
                   </SidebarMenuItem>
                 ) : null}
-                {/* Pinned projects render in the pinned section above (same
-                    grouping as the expanded sidebar). */}
-                {regularProjects.map((project) => (
+                {pinnedProjectList.map((project) => (
                   <SidebarMenuItem key={project.key}>
                     <ProjectFlyout
                       project={project}
@@ -631,36 +502,99 @@ export const SessionSidebar = memo(function SessionSidebar({
                   </SidebarMenuItem>
                 ))}
               </SidebarMenu>
-            ) : sessions.length === 0 ? (
-              <div className="sidebar-empty">
-                <span>No sessions yet</span>
-                <span className="sidebar-empty-hint">New sessions start in Home.</span>
-              </div>
             ) : (
-              <>
-                {regularProjects.map((project) => renderProjectRow(project))}
-                {recentSessions.length > 0 ? (
-                  <div className="sidebar-recent">
-                    <button
-                      type="button"
-                      className={`sidebar-recent-label${recentCollapsed ? " collapsed" : ""}`}
-                      onClick={() => setRecentCollapsed((current) => !current)}
-                      aria-expanded={!recentCollapsed}
-                    >
-                      <ChevronDown size={10} className="sidebar-recent-chevron" aria-hidden="true" />
-                      Recent
-                    </button>
-                    {recentCollapsed ? null : (
-                      <SidebarMenu className="sidebar-recent-list">
-                        {recentSessions.map((session) => renderSessionRow(session))}
-                      </SidebarMenu>
-                    )}
-                  </div>
-                ) : null}
-              </>
+              <div className="pinned-sessions">
+                <button
+                  type="button"
+                  className={`pinned-sessions-label${pinnedCollapsed ? " collapsed" : ""}`}
+                  onClick={() => setPinnedCollapsed((current) => !current)}
+                  aria-expanded={!pinnedCollapsed}
+                >
+                  <ChevronDown size={10} className="pinned-sessions-chevron" aria-hidden="true" />
+                  Pinned
+                </button>
+                {pinnedCollapsed ? null : (
+                  <>
+                    <SidebarMenu className="pinned-sessions-list">
+                      {pinnedSessionList.map((session) => renderSessionRow(session))}
+                    </SidebarMenu>
+                    {pinnedProjectList.map((project) => renderProjectRow(project))}
+                  </>
+                )}
+              </div>
+            )
+          ) : null}
+
+          <SidebarGroup className="sidebar-session-group">
+            {state === "collapsed" ? null : (
+              <SidebarGroupLabel>
+                PROJECTS
+                <SidebarGroupAction aria-label="Add project" title="Add project" onClick={onImportProject}>
+                  <Plus size={12} />
+                </SidebarGroupAction>
+              </SidebarGroupLabel>
             )}
-          </SidebarGroupContent>
-        </SidebarGroup>
+
+            <SidebarGroupContent>
+              {state === "collapsed" ? (
+                <SidebarMenu>
+                  {/* The default folder gets its own flyout entry ("Home") —
+                    its sessions live under Recent, not in a project group. */}
+                  {homeProject ? (
+                    <SidebarMenuItem key={homeProject.key}>
+                      <ProjectFlyout
+                        project={homeProject}
+                        label={pathBaseName(homeProject.cwd)}
+                        onExpand={() => expandToProject(homeProject.cwd)}
+                        {...flyoutProps}
+                      />
+                    </SidebarMenuItem>
+                  ) : null}
+                  {/* Pinned projects render in the pinned section above (same
+                    grouping as the expanded sidebar). */}
+                  {regularProjects.map((project) => (
+                    <SidebarMenuItem key={project.key}>
+                      <ProjectFlyout
+                        project={project}
+                        label={projectLabel(project)}
+                        projectPinned={pinnedProjects.has(project.key)}
+                        onExpand={() => expandToProject(project.cwd)}
+                        {...flyoutProps}
+                      />
+                    </SidebarMenuItem>
+                  ))}
+                </SidebarMenu>
+              ) : sessions.length === 0 ? (
+                <div className="sidebar-empty">
+                  <span>No sessions yet</span>
+                  <span className="sidebar-empty-hint">New sessions start in Home.</span>
+                </div>
+              ) : (
+                <>
+                  {regularProjects.map((project) => renderProjectRow(project))}
+                  {recentSessions.length > 0 ? (
+                    <div className="sidebar-recent">
+                      <button
+                        type="button"
+                        className={`sidebar-recent-label${recentCollapsed ? " collapsed" : ""}`}
+                        onClick={() => setRecentCollapsed((current) => !current)}
+                        aria-expanded={!recentCollapsed}
+                      >
+                        <ChevronDown size={10} className="sidebar-recent-chevron" aria-hidden="true" />
+                        Recent
+                      </button>
+                      {recentCollapsed ? null : (
+                        <SidebarMenu className="sidebar-recent-list">
+                          {recentSessions.map((session) => renderSessionRow(session))}
+                        </SidebarMenu>
+                      )}
+                    </div>
+                  ) : null}
+                </>
+              )}
+            </SidebarGroupContent>
+          </SidebarGroup>
+        </div>
       </SidebarContent>
 
       <SidebarFooter>

@@ -3,9 +3,20 @@ import { readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { basename, extname, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { app, BrowserWindow, clipboard, dialog, ipcMain, nativeImage, nativeTheme, shell } from "electron";
+import {
+  app,
+  BrowserWindow,
+  clipboard,
+  dialog,
+  ipcMain,
+  nativeImage,
+  nativeTheme,
+  powerMonitor,
+  shell,
+} from "electron";
 
 import type {
+  AutomationSaveRequest,
   AgentConfigSaveRequest,
   AppInfo,
   CreateProjectRequest,
@@ -37,6 +48,8 @@ import {
   setOpenWithApp,
   setTuiOptimizationsEnabled,
 } from "./services/app-settings-service";
+import { createAutomationExecutor } from "./services/automation-executor";
+import { AutomationService } from "./services/automation-service";
 import { CommandService } from "./services/command-service";
 import { debugLog, resetDebugLog } from "./services/debug-log";
 import { FileService } from "./services/file-service";
@@ -351,7 +364,10 @@ function registerHandlers(): void {
     return `data:${mime};base64,${data}`;
   });
 
-  ipcMain.handle("sessions:list", () => sessions.list());
+  ipcMain.handle("sessions:list", async () => {
+    await automations.list().catch((error) => debugLog("[automations] load failed", String(error)));
+    return automations.decorateSessions(await sessions.list());
+  });
   ipcMain.handle("sessions:create", async (_event, request: CreateSessionRequest) => {
     return sessions.create(request.cwd?.trim() || activeCwd());
   });
@@ -416,6 +432,15 @@ function registerHandlers(): void {
   ipcMain.handle("commands:argument-completions", (_event, cwd: string, command: string, argumentPrefix: string) =>
     commands.argumentCompletions(cwd || activeCwd(), command, argumentPrefix),
   );
+
+  ipcMain.handle("automations:list", () => automations.list());
+  ipcMain.handle("automations:save", (_event, request: AutomationSaveRequest) => automations.save(request));
+  ipcMain.handle("automations:set-enabled", (_event, id: string, enabled: boolean) =>
+    automations.setEnabled(id, enabled),
+  );
+  ipcMain.handle("automations:remove", (_event, id: string) => automations.remove(id));
+  ipcMain.handle("automations:run-now", (_event, id: string) => automations.runNow(id));
+  ipcMain.handle("automations:stop", (_event, runId: string) => automations.stop(runId));
 
   ipcMain.handle("skills:list", (_event, cwd: string) => skills.list(cwd || activeCwd()));
   ipcMain.handle("skills:read", (_event, cwd: string, filePath: string) => skills.read(cwd || activeCwd(), filePath));
@@ -496,7 +521,7 @@ function registerHandlers(): void {
   ipcMain.on("side-terminal:kill", (_event, id: string) => sideTerminals.kill(id));
   sideTerminals.onData((id, data) => sendToRenderer("side-terminal:data", { id, data }));
 
-  ipcMain.handle("models:list", () => models.list(activeCwd()));
+  ipcMain.handle("models:list", (_event, cwd?: string) => models.list(cwd || activeCwd()));
   ipcMain.handle("models:login", async (_event, request: ModelLoginRequest) => {
     const state = await models.login(request, activeCwd(), (loginEvent) => {
       sendToRenderer("models:login-event", loginEvent);
@@ -642,7 +667,7 @@ runtime.onSessionFileChanged(() => {
     sessionListRefreshTimer = undefined;
     void sessions
       .list()
-      .then((next) => sendToRenderer("sessions:updated", next))
+      .then((next) => sendToRenderer("sessions:updated", automations.decorateSessions(next)))
       .catch(() => undefined);
   }, 300);
 });
@@ -655,13 +680,15 @@ projects.onUpdated((next) => sendToRenderer("projects:updated", next));
 let notificationHintShown = false;
 const notifications = new TaskNotificationService(
   (sessionPath) => {
-    if (!mainWindow) return;
-    if (mainWindow.isMinimized()) mainWindow.restore();
-    mainWindow.show();
-    mainWindow.focus();
-    // Ask the renderer to open this session so the banner click lands on
-    // the conversation that finished.
-    sendToRenderer("notifications:open-session", sessionPath);
+    if (!mainWindow) createWindow();
+    const window = mainWindow;
+    if (!window) return;
+    if (window.isMinimized()) window.restore();
+    window.show();
+    window.focus();
+    const open = () => sendToRenderer("notifications:open-session", sessionPath);
+    if (window.webContents.isLoadingMainFrame()) window.webContents.once("did-finish-load", open);
+    else open();
   },
   () => {
     // macOS refuses banners without notification permission and never asks
@@ -686,6 +713,8 @@ const notifications = new TaskNotificationService(
   },
 );
 runtime.onState((state) => {
+  void automations.observe(state).catch((error) => debugLog("[automations] observe failed", String(error)));
+  if (automations.ownsSession(state.sessionPath)) return;
   notifications.observe(state, {
     activeSessionPath: runtime.activeSessionPath,
     windowFocused: mainWindow?.isFocused() ?? false,
@@ -699,6 +728,34 @@ packages.setProgressListener((progress) => sendToRenderer("packages:progress", p
 if (!app.isPackaged) {
   app.setPath("userData", app.getPath("userData") + "-dev");
 }
+
+const automations = new AutomationService(
+  join(app.getPath("userData"), "automations.json"),
+  createAutomationExecutor({
+    runtime,
+    sessions,
+    models,
+    skills,
+    sessionsChanged: async () =>
+      sendToRenderer("sessions:updated", automations.decorateSessions(await sessions.list())),
+    notify: (run) => {
+      const body =
+        run.status === "waiting"
+          ? "Automation needs your input"
+          : run.status === "success"
+            ? "Automation completed"
+            : run.status === "timed_out"
+              ? "Automation timed out"
+              : "Automation failed";
+      void notifications.notify(
+        { status: "idle", generation: 0, sessionPath: run.sessionPath ?? "", cwd: run.cwd },
+        body,
+        { detail: `${run.taskName}${run.detail ? `: ${run.detail}` : ""}` },
+      );
+    },
+  }),
+);
+automations.onUpdated((state) => sendToRenderer("automations:updated", state));
 
 const hasLock = app.requestSingleInstanceLock();
 if (!hasLock) {
@@ -723,15 +780,31 @@ if (!hasLock) {
     registerHandlers();
     void cleanupStalePastedImages();
     createWindow();
+    void automations.start().catch((error) => {
+      debugLog("[automations] initialization failed", String(error));
+      sendToRenderer("automations:updated", { tasks: [], runs: [], error: String(error) });
+    });
+    powerMonitor.on("suspend", () => automations.suspend());
+    powerMonitor.on("resume", () => {
+      void automations.resume().catch(() => undefined);
+    });
     app.on("activate", () => {
       if (BrowserWindow.getAllWindows().length === 0) createWindow();
     });
   });
 
-  app.on("before-quit", () => {
-    void runtime.stop();
+  let quitting = false;
+  app.on("before-quit", (event) => {
+    if (quitting) return;
+    event.preventDefault();
+    quitting = true;
     sideTerminals.killAll();
     workspaceWatcher.dispose();
+    void automations
+      .shutdown()
+      .catch((error) => debugLog("[automations] shutdown failed", String(error)))
+      .then(() => runtime.stop())
+      .finally(() => app.quit());
   });
 
   app.on("window-all-closed", () => {

@@ -580,6 +580,13 @@ export class ModelService {
               contextWindow: model.contextWindow,
               maxTokens: model.maxTokens,
               available: availableModels.has(`${model.provider}/${model.id}`),
+              supportedThinkingLevels: (["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const).filter(
+                (level) => {
+                  if (!model.reasoning) return level === "off";
+                  const mapped = model.thinkingLevelMap?.[level];
+                  return mapped !== null && ((level !== "xhigh" && level !== "max") || mapped !== undefined);
+                },
+              ),
             }))
             .sort((left, right) => left.name.localeCompare(right.name)),
         };
@@ -597,6 +604,7 @@ export class ModelService {
     return {
       providers,
       defaultModel: defaultProvider && defaultModel ? { provider: defaultProvider, id: defaultModel } : undefined,
+      defaultThinkingLevel: settings.getDefaultThinkingLevel(),
       error: runtime.getError(),
     };
   }

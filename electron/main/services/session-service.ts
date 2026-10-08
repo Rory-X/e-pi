@@ -84,11 +84,12 @@ export class SessionService {
     return toSessionSummary(session);
   }
 
-  async rename(path: string, name: string): Promise<void> {
+  async rename(path: string, name: string, options: { automation?: boolean } = {}): Promise<void> {
     const normalized = normalizeText(name);
     if (!normalized) throw new Error("Session name cannot be empty.");
-    if (normalized.length > SESSION_NAME_MAX_LENGTH) {
-      throw new Error(`Session name must be ${SESSION_NAME_MAX_LENGTH} characters or fewer.`);
+    const limit = options.automation ? 200 : SESSION_NAME_MAX_LENGTH;
+    if (normalized.length > limit) {
+      throw new Error(`Session name must be ${limit} characters or fewer.`);
     }
 
     const { SessionManager } = await loadPiAgent();

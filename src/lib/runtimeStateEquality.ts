@@ -19,6 +19,9 @@ export function isSameRuntimeState(a: PiRuntimeState, b: PiRuntimeState): boolea
     a.generation === b.generation &&
     a.activity === b.activity &&
     sameWaitingUser(a.waitingUser, b.waitingUser) &&
+    a.turnResult?.serial === b.turnResult?.serial &&
+    a.turnResult?.status === b.turnResult?.status &&
+    a.turnResult?.error === b.turnResult?.error &&
     sameModelRef(a.model, b.model) &&
     a.thinkingLevel === b.thinkingLevel &&
     sameStringArray(a.supportedThinkingLevels, b.supportedThinkingLevels) &&

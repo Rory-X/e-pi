@@ -1,4 +1,4 @@
-import { Archive, MoreVertical, Pin } from "lucide-react";
+import { Archive, Clock3, MoreVertical, Pin } from "lucide-react";
 import { useState } from "react";
 
 import {
@@ -94,6 +94,9 @@ export function SessionRow({
               onDoubleClick={renameOnDoubleClick}
             >
               <ActivityIndicator runtime={runtime} />
+              {session.automation ? (
+                <Clock3 size={12} className="session-automation-mark" aria-label="Automation session" />
+              ) : null}
               <span className={labelClassName}>{title}</span>
               {trailing}
             </button>
@@ -107,6 +110,9 @@ export function SessionRow({
               onDoubleClick={renameOnDoubleClick}
             >
               <ActivityIndicator runtime={runtime} />
+              {session.automation ? (
+                <Clock3 size={12} className="session-automation-mark" aria-label="Automation session" />
+              ) : null}
               <span className={labelClassName}>{title}</span>
               {trailing}
             </SidebarMenuButton>

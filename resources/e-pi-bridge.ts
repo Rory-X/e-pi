@@ -264,6 +264,7 @@ interface BridgeWaitingUser {
 }
 
 interface BridgeState {
+  turnResult?: { serial: number; status: "success" | "error" | "cancelled"; error?: string } | null;
   status: "busy" | "idle";
   model?: { provider: string; id: string };
   /** Current thinking level in this pi process (after model clamping). */
@@ -752,6 +753,9 @@ export default function ePiBridge(pi: ExtensionAPI): void {
     },
   });
 
+  let settledSerial = 0;
+  let lastOutcome: { status: "success" | "error" | "cancelled"; error?: string } = { status: "success" };
+
   pi.on("session_start", (_event, ctx) => {
     activeCtx = ctx;
     applyThemeFromHint(ctx.ui);
@@ -768,6 +772,7 @@ export default function ePiBridge(pi: ExtensionAPI): void {
     // stale value from a previous run never bleeds into the fresh session.
     reportState(ctx, {
       status: "idle",
+      turnResult: null,
       model: ctx.model ? { provider: ctx.model.provider, id: ctx.model.id } : undefined,
       thinkingLevel: ctx.thinkingLevel,
       supportedThinkingLevels: supportedThinkingLevelsOf(ctx.model),
@@ -796,7 +801,8 @@ export default function ePiBridge(pi: ExtensionAPI): void {
     // this extension event fires before or after the core creates the
     // indicator (setWorkingMessage persists the label either way).
     startWorkingTimer(ctx);
-    reportState(ctx, { status: "busy" });
+    lastOutcome = { status: "success" };
+    reportState(ctx, { status: "busy", turnResult: null });
   });
 
   // agent_settled fires only when no retry, compaction retry, or queued
@@ -806,6 +812,7 @@ export default function ePiBridge(pi: ExtensionAPI): void {
     ctx.ui.setWorkingMessage("Working...");
     reportState(ctx, {
       status: "idle",
+      turnResult: { serial: ++settledSerial, ...lastOutcome },
       context: contextUsageOf(ctx),
       usage: sessionUsage,
       cacheHitRate: sessionCacheHitRate,
@@ -873,6 +880,12 @@ export default function ePiBridge(pi: ExtensionAPI): void {
 
   pi.on("message_end", (event, ctx) => {
     if (event.message.role === "assistant") {
+      lastOutcome =
+        event.message.stopReason === "error"
+          ? { status: "error", error: event.message.errorMessage ?? "Model request failed." }
+          : event.message.stopReason === "aborted"
+            ? { status: "cancelled", error: "Pi run was interrupted." }
+            : { status: "success" };
       addUsage(sessionUsage, event.message.usage);
       const usage = event.message.usage;
       const promptTokens = usage.input + usage.cacheRead + usage.cacheWrite;

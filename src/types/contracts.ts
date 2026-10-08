@@ -92,6 +92,7 @@ export interface SessionSummary {
   messageCount: number;
   firstMessage: string;
   searchText: string;
+  automation?: { taskId: string; runId: string };
 }
 
 /**
@@ -159,6 +160,8 @@ export interface PiRuntimeState {
    * The turn is NOT finished — it continues once the user interacts.
    */
   waitingUser?: WaitingUserState | null;
+  /** Completion survives missed busy/idle sidecar updates for short runs. */
+  turnResult?: PiTurnResult | null;
   /** Model currently selected inside this session's Pi process. */
   model?: ModelRef;
   /** Current thinking level inside this session's Pi process (after model clamping). */
@@ -177,6 +180,82 @@ export interface PiRuntimeState {
   exitCode?: number;
   signal?: number;
   error?: string;
+}
+
+export interface PiTurnResult {
+  serial: number;
+  status: "success" | "error" | "cancelled";
+  error?: string;
+}
+
+export type AutomationSchedule =
+  | { kind: "once"; localDateTime: string }
+  | { kind: "interval"; every: number; unit: "minutes" | "hours"; anchor: string }
+  | { kind: "weekly"; weekdays: number[]; time: string };
+
+export interface AutomationInput {
+  name: string;
+  prompt: string;
+  cwd: string;
+  skill?: { name: string; filePath: string };
+  model: ModelRef;
+  thinkingLevel: Exclude<AgentThinkingLevel, "">;
+  schedule: AutomationSchedule;
+  timezone: string;
+  timeoutMinutes: number;
+  notifyOnSuccess: boolean;
+}
+
+export interface AutomationTask extends AutomationInput {
+  id: string;
+  enabled: boolean;
+  createdAt: string;
+  updatedAt: string;
+  nextRunAt?: string;
+  deletedAt?: string;
+}
+
+export type AutomationRunStatus =
+  | "queued"
+  | "starting"
+  | "running"
+  | "waiting"
+  | "success"
+  | "failed"
+  | "cancelled"
+  | "timed_out"
+  | "skipped"
+  | "missed";
+
+export interface AutomationRun {
+  id: string;
+  taskId: string;
+  taskName: string;
+  cwd: string;
+  timezone: string;
+  scheduledAt: string;
+  createdAt: string;
+  trigger: "schedule" | "manual";
+  status: AutomationRunStatus;
+  startedAt?: string;
+  finishedAt?: string;
+  sessionPath?: string;
+  elapsedMs: number;
+  detail?: string;
+  missedCount?: number;
+  /** Snapshot: edits cannot change an already queued/running execution. */
+  config: AutomationInput;
+}
+
+export interface AutomationState {
+  tasks: AutomationTask[];
+  runs: AutomationRun[];
+  error?: string;
+}
+
+export interface AutomationSaveRequest {
+  id?: string;
+  input: AutomationInput;
 }
 
 export interface PackageRecord {
@@ -273,6 +352,7 @@ export interface ModelRecord {
   contextWindow: number;
   maxTokens: number;
   available: boolean;
+  supportedThinkingLevels?: Exclude<AgentThinkingLevel, "">[];
 }
 
 export interface ModelProviderRecord {
@@ -291,6 +371,7 @@ export interface ModelProviderRecord {
 export interface ModelManagementState {
   providers: ModelProviderRecord[];
   defaultModel?: ModelRef;
+  defaultThinkingLevel?: Exclude<AgentThinkingLevel, "">;
   error?: string;
 }
 
@@ -720,7 +801,7 @@ export interface EPiApi {
     onProgress(listener: (progress: PackageProgress) => void): () => void;
   };
   models: {
-    list(): Promise<ModelManagementState>;
+    list(cwd?: string): Promise<ModelManagementState>;
     login(request: ModelLoginRequest): Promise<ModelManagementState>;
     respondToLogin(response: ModelLoginResponse): void;
     cancelLogin(): void;
@@ -768,6 +849,15 @@ export interface EPiApi {
     addPath(request: SkillAddPathRequest): Promise<SkillRecord[]>;
     remove(request: SkillMutation): Promise<SkillRecord[]>;
     setEnabled(request: SkillSetEnabledRequest): Promise<SkillRecord[]>;
+  };
+  automations: {
+    list(): Promise<AutomationState>;
+    save(request: AutomationSaveRequest): Promise<AutomationState>;
+    setEnabled(id: string, enabled: boolean): Promise<AutomationState>;
+    remove(id: string): Promise<AutomationState>;
+    runNow(id: string): Promise<AutomationState>;
+    stop(runId: string): Promise<AutomationState>;
+    onUpdated(listener: (state: AutomationState) => void): () => void;
   };
   git: {
     status(cwd: string): Promise<GitStatus>;

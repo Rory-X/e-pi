@@ -8,6 +8,7 @@ import { ImportMultiRepoDialog } from "@/components/settings/ImportMultiRepoDial
 import { IconButton } from "@/components/ui/IconButton";
 import { SidebarInset, SidebarProvider, SidebarRail, Sidebar } from "@/components/ui/sidebar";
 import { AppHeader } from "@/components/workspace/AppHeader";
+import { AutomationPanel } from "@/components/workspace/AutomationPanel";
 import { Composer } from "@/components/workspace/Composer";
 import { SessionSidebar } from "@/components/workspace/SessionSidebar";
 import { SkillPanel } from "@/components/workspace/SkillPanel";
@@ -15,8 +16,8 @@ import { TerminalPanel } from "@/components/workspace/TerminalPanel";
 import { ToolPanel } from "@/components/workspace/ToolPanel";
 import type { PanelState, PanelTab, PanelView } from "@/components/workspace/ToolPanel";
 import { WorkspaceOverlayHost } from "@/components/workspace/WorkspaceOverlayHost";
-import { clearAllTerminalBuffers, clearTerminalBuffer } from "@/lib/terminalReplayStore";
 import { sessionRenameDraft } from "@/lib/format";
+import { clearAllTerminalBuffers, clearTerminalBuffer } from "@/lib/terminalReplayStore";
 
 import { useGlobalShortcuts } from "./hooks/useGlobalShortcuts";
 import { useSessionRuntime } from "./hooks/useSessionRuntime";
@@ -47,6 +48,7 @@ export function App() {
   }, [unseenRuns]);
   const [packageOpen, setPackageOpen] = useState(false);
   const [skillOpen, setSkillOpen] = useState(false);
+  const [automationOpen, setAutomationOpen] = useState(false);
   const [renameTarget, setRenameTarget] = useState<SessionSummary>();
   const [renameName, setRenameName] = useState("");
   const [removeTarget, setRemoveTarget] = useState<SessionSummary>();
@@ -287,11 +289,22 @@ export function App() {
   // Clicking a task-completion banner opens that session in the UI.
   useEffect(() => {
     return window.ePi.notifications.onOpenSession((sessionPath) => {
-      const session = sessions.find((candidate) => candidate.path === sessionPath);
-      if (!session) return;
-      selectSession(session);
+      if (!sessionPath) {
+        setAutomationOpen(true);
+        return;
+      }
+      void window.ePi.sessions
+        .list()
+        .then((fresh) => {
+          const session = fresh.find((candidate) => candidate.path === sessionPath);
+          if (session) {
+            setAutomationOpen(false);
+            selectSession(session);
+          } else setAutomationOpen(true);
+        })
+        .catch(() => setAutomationOpen(true));
     });
-  });
+  }, [selectSession]);
 
   const renameSession = useCallback(async (session: SessionSummary) => {
     setRenameTarget(session);
@@ -619,6 +632,7 @@ export function App() {
   const modalOpen =
     packageOpen ||
     skillOpen ||
+    automationOpen ||
     settingsOpen ||
     importOpen ||
     renameTarget !== undefined ||
@@ -659,6 +673,7 @@ export function App() {
           onCopyText={copyText}
           onOpenPackages={openPackages}
           onOpenSkills={openSkills}
+          onOpenAutomations={() => setAutomationOpen(true)}
           onOpenSettings={openSettings}
         />
 
@@ -783,6 +798,20 @@ export function App() {
 
       <PackagePanel open={packageOpen} cwd={activeCwd} onOpenChange={setPackageOpen} onReloadPi={onReloadPi} />
       <SkillPanel open={skillOpen} cwd={activeCwd} onOpenChange={setSkillOpen} onReloadPi={onReloadPi} />
+      <AutomationPanel
+        open={automationOpen}
+        cwd={activeCwd}
+        projects={projects}
+        runtime={runtimeState}
+        onOpenChange={setAutomationOpen}
+        onOpenSession={async (path) => {
+          const fresh = await window.ePi.sessions.list();
+          await refreshSessions();
+          const session = fresh.find((item) => item.path === path);
+          if (!session) throw new Error("Session was removed or archived. Restore it from Settings if archived.");
+          selectSession(session);
+        }}
+      />
       <ImportMultiRepoDialog
         open={importOpen}
         defaultPath={appInfo?.defaultCwd}
