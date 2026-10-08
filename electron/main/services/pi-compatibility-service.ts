@@ -17,26 +17,13 @@ type PlannedFileChange = {
   content: string;
 };
 
-const PATCH_SPECS = [
-  {
-    names: ["pi-coding-agent.patch", "@earendil-works__pi-coding-agent@0.84.2.patch", "@earendil-works__pi-coding-agent@0.84.0.patch"],
-    target: (packageDir: string) => packageDir,
-  },
-  {
-    names: ["pi-tui.patch", "@earendil-works__pi-tui@0.84.2.patch", "@earendil-works__pi-tui@0.84.0.patch"],
-    target: (packageDir: string) => resolvePiTuiDir(packageDir),
-  },
-] as const;
-
 const PI_TUI_PROBE_PREFIX = "node_modules/@earendil-works/pi-tui/";
 
-const COMPATIBILITY_PROBES = [
-  ["dist/modes/interactive/interactive-mode.js", "E_PI_TUI_OPTIMIZATIONS"],
-  ["dist/modes/interactive/interactive-mode.js", 'const externalComposer = process.env.E_PI === "true"'],
-  ["dist/modes/interactive/interactive-mode.js", "externalComposer ? new Container() : this.documentContainer"],
-  ["dist/modes/interactive/interactive-mode.js", "fullscreenTranscriptContainer.addChild(new Spacer(4))"],
-  ["dist/modes/interactive/interactive-mode.js", "component.ePiVirtualRenderVolatile = true"],
-  ["dist/modes/interactive/interactive-mode.js", "component.ePiNavUserMessage = true"],
+/**
+ * The pi-tui patch carries the same feature code on every supported Pi line,
+ * so its probes are shared by all profiles.
+ */
+const TUI_PROBES = [
   ["node_modules/@earendil-works/pi-tui/dist/components/markdown.js", "renderInvalidationRevision"],
   ["node_modules/@earendil-works/pi-tui/dist/components/scroll-view.js", "renderVirtualViewport(width"],
   ["node_modules/@earendil-works/pi-tui/dist/components/scroll-view.js", "scrollToVirtualBlock(component)"],
@@ -48,6 +35,141 @@ const COMPATIBILITY_PROBES = [
   ["node_modules/@earendil-works/pi-tui/dist/tui-alt-screen.js", "buildEPiNavOsc(primaryScrollView)"],
   ["node_modules/@earendil-works/pi-tui/dist/tui.js", "renderInvalidationRevision"],
 ] as const;
+
+type CompatibilityProfile = {
+  /** Candidate patch file names for each dependency; first existing wins. */
+  agentPatchNames: readonly string[];
+  tuiPatchNames: readonly string[];
+  /** Marker strings that must all be present once the profile is applied. */
+  probes: readonly (readonly [string, string])[];
+};
+
+/**
+ * Probes shared by every line that stores the fullscreen layout in
+ * `chat-viewport.js` (0.85 and later; 0.84 keeps it inline in
+ * `interactive-mode.js` and therefore needs its own list).
+ *
+ * The replacement dock itself sits in the profile's own probe list, because
+ * its identifier differs between lines — 0.85 rewrites upstream's dock entry
+ * list inline, while 0.86+ derive a separate `ePiDock` from it.
+ */
+const CHAT_VIEWPORT_PROBES = [
+  ["dist/modes/interactive/chat-viewport.js", "E_PI_TUI_OPTIMIZATIONS"],
+  ["dist/modes/interactive/chat-viewport.js", 'const externalComposer = process.env.E_PI === "true"'],
+  ["dist/modes/interactive/chat-viewport.js", "fullscreenTranscriptContainer.addChild(new Spacer(4))"],
+  ["dist/modes/interactive/interactive-mode.js", "component.ePiVirtualRenderVolatile = true"],
+  ["dist/modes/interactive/interactive-mode.js", "component.ePiNavUserMessage = true"],
+  ...TUI_PROBES,
+] as const;
+
+/** 0.86+ builds a separate replacement dock instead of rewriting upstream's. */
+const SEPARATE_DOCK_PROBE = [["dist/modes/interactive/chat-viewport.js", "const ePiDock = externalComposer"]] as const;
+
+/**
+ * One profile per supported Pi minor line (`major.minor`). Each profile's
+ * patches are unified diffs generated against that line's dist files; the
+ * fuzzy hunk matcher tolerates patch-level drift within the line, and a line
+ * whose hunks no longer match fails the transactional apply before anything
+ * is written. Pi moved the fullscreen layout into `chat-viewport.js` in
+ * 0.85, which is why the agent probes differ between lines.
+ *
+ * Adding a line is a two-file change: a patch per dependency, plus the profile
+ * below. The 0.86 line needed only the agent patch — pi-tui's dist files are
+ * byte-identical to 0.85.1 except `tui-alt-screen.js`, and even that hunk still
+ * matched. Its patch is therefore generated from the 0.86.1 dist so the hunks
+ * are byte-aligned rather than relying on fuzz.
+ *
+ * These patches now cover only what cannot be reached from a stable API
+ * boundary — principally pi-tui's virtual scrolling, whose code is injected
+ * *inside* `layout.js`'s unexported `layoutComponent` and ScrollView's
+ * internals. Behavior that can be expressed by wrapping an exported method
+ * lives in `resources/e-pi-tui-hooks.mjs` instead, which rewrites modules in
+ * memory at load time and is therefore immune to upstream renames.
+ *
+ * Patch names are listed newest-first and are mutually exclusive: 0.85.1
+ * rewrote the wheel-scroll expression the tui patch anchors on, so each
+ * patch variant matches exactly one upstream build. The fuzzy matcher must
+ * not be able to pick a patch from a different patch level, or it would
+ * silently drop the upstream changes the newer patch was generated against.
+ */
+const COMPATIBILITY_PROFILES: Readonly<Record<string, CompatibilityProfile>> = {
+  "0.84": {
+    agentPatchNames: [
+      "@earendil-works__pi-coding-agent@0.84.2.patch",
+      "@earendil-works__pi-coding-agent@0.84.0.patch",
+      "pi-coding-agent.patch",
+    ],
+    tuiPatchNames: ["@earendil-works__pi-tui@0.84.2.patch", "@earendil-works__pi-tui@0.84.0.patch", "pi-tui.patch"],
+    probes: [
+      ["dist/modes/interactive/interactive-mode.js", "E_PI_TUI_OPTIMIZATIONS"],
+      ["dist/modes/interactive/interactive-mode.js", 'const externalComposer = process.env.E_PI === "true"'],
+      ["dist/modes/interactive/interactive-mode.js", "externalComposer ? new Container() : this.documentContainer"],
+      ["dist/modes/interactive/interactive-mode.js", "fullscreenTranscriptContainer.addChild(new Spacer(4))"],
+      ["dist/modes/interactive/interactive-mode.js", "component.ePiVirtualRenderVolatile = true"],
+      ["dist/modes/interactive/interactive-mode.js", "component.ePiNavUserMessage = true"],
+      ...TUI_PROBES,
+    ],
+  },
+  "0.85": {
+    // The agent-side patch targets (`chat-viewport.js`, `interactive-mode.js`)
+    // are byte-identical across 0.85.0 and 0.85.1, so one patch covers the
+    // whole patch level — unlike pi-tui, where 0.85.1 rewrote a hunk anchor.
+    agentPatchNames: ["@earendil-works__pi-coding-agent@0.85.0.patch", "pi-coding-agent.patch"],
+    tuiPatchNames: ["@earendil-works__pi-tui@0.85.1.patch", "@earendil-works__pi-tui@0.85.0.patch", "pi-tui.patch"],
+    probes: CHAT_VIEWPORT_PROBES,
+  },
+  "0.86": {
+    // 0.86.1 changed one line in `chat-viewport.js` (the dock's footer entry
+    // went from `minSize: 1` to `minSize: 0`). The 0.85 agent patch anchored on
+    // that literal, so it stopped matching; the 0.86 patch keeps upstream's
+    // dock entry list as untouched context and inserts a replacement dock
+    // after it, which is what makes the same upstream line irrelevant here.
+    // The patch also applies to 0.86.0: that release differs only in
+    // `interactive-mode.js`, and the hunks there are context-anchored.
+    agentPatchNames: ["@earendil-works__pi-coding-agent@0.86.1.patch", "pi-coding-agent.patch"],
+    // pi-tui's dist is byte-identical between 0.85.1 and 0.86.1, so the 0.85.1
+    // patch is a valid fallback if the 0.86.1 one is ever absent.
+    tuiPatchNames: ["@earendil-works__pi-tui@0.86.1.patch", "@earendil-works__pi-tui@0.85.1.patch", "pi-tui.patch"],
+    probes: [...CHAT_VIEWPORT_PROBES, ...SEPARATE_DOCK_PROBE],
+  },
+  "0.87": {
+    // 0.87.0 added code to `interactive-mode.js` (a crash-extension hint and two
+    // new stream branches) and reworked the scroll-to-end indicator in
+    // pi-tui's `tui-alt-screen.js`. Neither touched anything E-Pi anchors on:
+    // both patches apply, and the only difference from the 0.86.1 patches is
+    // hunk line numbers. Patches are still regenerated per line so the hunks
+    // are byte-aligned to this dist rather than relying on the fuzzy matcher.
+    agentPatchNames: ["@earendil-works__pi-coding-agent@0.87.0.patch", "pi-coding-agent.patch"],
+    tuiPatchNames: ["@earendil-works__pi-tui@0.87.0.patch", "@earendil-works__pi-tui@0.86.1.patch", "pi-tui.patch"],
+    probes: [...CHAT_VIEWPORT_PROBES, ...SEPARATE_DOCK_PROBE],
+  },
+  "0.99": {
+    // 0.99 keeps the transcript layout, but routeWheel now accepts a computed
+    // delta from WheelScrollAccelerator. Use a dedicated patch that preserves
+    // that accelerator and Markdown's new parsed-token cache.
+    agentPatchNames: ["@earendil-works__pi-coding-agent@0.99.2.patch", "@earendil-works__pi-coding-agent@0.99.1.patch"],
+    tuiPatchNames: ["@earendil-works__pi-tui@0.99.2.patch", "@earendil-works__pi-tui@0.99.1.patch"],
+    probes: [
+      ...CHAT_VIEWPORT_PROBES,
+      ...SEPARATE_DOCK_PROBE,
+      ["node_modules/@earendil-works/pi-tui/dist/tui-alt-screen.js", "event.lines ?? delta : delta"],
+    ],
+  },
+  "1.1": {
+    // Upstream keeps the same full-transcript layout. Preserve 1.1's weak
+    // Markdown token cache, Text.setPaddingX and image redraw fixes while
+    // adding the E-Pi virtual viewport and host composer/navigation contract.
+    agentPatchNames: ["@earendil-works__pi-coding-agent@1.1.0.patch"],
+    tuiPatchNames: ["@earendil-works__pi-tui@1.1.0.patch"],
+    probes: [
+      ...CHAT_VIEWPORT_PROBES,
+      ...SEPARATE_DOCK_PROBE,
+      ["node_modules/@earendil-works/pi-tui/dist/tui-alt-screen.js", "event.lines ?? delta : delta"],
+      ["node_modules/@earendil-works/pi-tui/dist/components/markdown.js", "this.cachedTokens?.deref()"],
+      ["node_modules/@earendil-works/pi-tui/dist/components/text.js", "setPaddingX(paddingX)"],
+    ],
+  },
+};
 
 const PATCH_PRESENCE_PROBES = [
   ["dist/modes/interactive/interactive-mode.js", "ePiVirtualRenderVolatile"],
@@ -71,6 +193,83 @@ function compatibilityProbePath(packageDir: string, relativePath: string): strin
     return join(resolvePiTuiDir(packageDir), relativePath.slice(PI_TUI_PROBE_PREFIX.length));
   }
   return join(packageDir, relativePath);
+}
+
+function readPackageVersion(packageDir: string): string | undefined {
+  try {
+    const version = (JSON.parse(readFileSync(join(packageDir, "package.json"), "utf8")) as { version?: unknown })
+      .version;
+    return typeof version === "string" && version.length > 0 ? version : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** The package's `major.minor` line, e.g. "0.87", or undefined if unreadable. */
+function versionLine(packageDir: string): string | undefined {
+  const version = readPackageVersion(packageDir);
+  return (version ? /^(\d+\.\d+)\./.exec(version)?.[1] : undefined) ?? undefined;
+}
+
+/** Order two `major.minor` lines numerically. */
+function lineGt(a: string, b: string): boolean {
+  const pa = a.split(".").map(Number);
+  const pb = b.split(".").map(Number);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const diff = (pa[i] ?? 0) - (pb[i] ?? 0);
+    if (diff !== 0) return diff > 0;
+  }
+  return false;
+}
+
+/**
+ * How many minor lines above the newest known line may still inherit it.
+ *
+ * One covers the realistic cadence (a new minor, or a patch-level release that
+ * shifted line numbers). Anything further is a genuine signal that upstream has
+ * moved on and a human should look, so it is refused instead of silently
+ * applying a patch written for older upstream text.
+ */
+const MAX_INHERITED_MINOR_GAP = 1;
+
+/** Signed minor distance between two same-major lines, or undefined if majors differ. */
+function minorGap(fromLine: string, toLine: string): number | undefined {
+  const [fromMajor, fromMinor] = fromLine.split(".").map(Number);
+  const [toMajor, toMinor] = toLine.split(".").map(Number);
+  if (fromMajor !== toMajor) return undefined;
+  return toMinor - fromMinor;
+}
+
+/**
+ * The profile to use for a package.
+ *
+ * An exact `major.minor` match wins. When E-Pi has not been built against the
+ * line yet, the newest known line may be inherited, so a release that only
+ * shifted line numbers keeps working without a code change — the common case
+ * by far, and the one that produced three consecutive false "needs stock TUI"
+ * reports. Inheritance is bounded to one minor line and is never a promise:
+ * the apply below is transactional and gated on the profile's probes, so a
+ * release that really did move the internals E-Pi anchors on fails loudly and
+ * leaves the package byte-for-byte unchanged.
+ *
+ * A line below every known profile is refused outright — falling forward would
+ * apply patches written against newer upstream text.
+ */
+function compatibilityProfileFor(packageDir: string): CompatibilityProfile | undefined {
+  const line = versionLine(packageDir);
+  if (!line) return undefined;
+
+  const exact = COMPATIBILITY_PROFILES[line];
+  if (exact) return exact;
+
+  const newest = Object.keys(COMPATIBILITY_PROFILES)
+    .sort((a, b) => (lineGt(a, b) ? 1 : -1))
+    .pop();
+  if (!newest) return undefined;
+
+  const gap = minorGap(newest, line);
+  if (gap === undefined || gap < 0 || gap > MAX_INHERITED_MINOR_GAP) return undefined;
+  return COMPATIBILITY_PROFILES[newest];
 }
 
 function parseUnifiedPatch(source: string): UnifiedFilePatch[] {
@@ -227,7 +426,9 @@ export function applyUnifiedPatch(rootDir: string, patchSource: string): void {
 }
 
 export function isPiCompatibilityApplied(packageDir: string): boolean {
-  return COMPATIBILITY_PROBES.every(([relativePath, marker]) => {
+  const profile = compatibilityProfileFor(packageDir);
+  if (!profile) return false;
+  return profile.probes.every(([relativePath, marker]) => {
     try {
       return readFileSync(compatibilityProbePath(packageDir, relativePath), "utf8").includes(marker);
     } catch {
@@ -280,7 +481,21 @@ function compatibilityPatchDir(): string {
   return join(process.cwd(), "patches");
 }
 
-function resolvePatchFile(dir: string, names: readonly string[]): string {
+function resolvePatchFile(dir: string, names: readonly string[], packageDir: string): string {
+  // Patch variants within a minor line are mutually exclusive: each is
+  // generated against one patch-level dist, and its hunks carry the upstream
+  // text of that exact build. So the choice is made by the installed version,
+  // never by which file happens to exist — otherwise a co-installed 0.85.1
+  // patch would be applied to a 0.85.0 package, and the fuzzy matcher would
+  // silently drop the upstream line it was generated against.
+  const version = readPackageVersion(packageDir);
+  if (version) {
+    for (const name of names) {
+      // Names carry the exact level they were generated for.
+      const level = /@(\d+\.\d+\.\d+)\.patch$/.exec(name)?.[1];
+      if (level === version && existsSync(join(dir, name))) return join(dir, name);
+    }
+  }
   for (const name of names) {
     const candidate = join(dir, name);
     if (existsSync(candidate)) return candidate;
@@ -296,12 +511,20 @@ function resolvePatchFile(dir: string, names: readonly string[]): string {
 export function applyPiCompatibilityPatches(packageDir: string): void {
   if (isPiCompatibilityApplied(packageDir)) return;
 
+  const profile = compatibilityProfileFor(packageDir);
+  if (!profile) {
+    throw new Error(`No E-Pi TUI compatibility profile for Pi ${readPackageVersion(packageDir) ?? "unknown version"}.`);
+  }
+
   const patchDir = compatibilityPatchDir();
   const changes = new Map<string, PlannedFileChange>();
-  for (const spec of PATCH_SPECS) {
-    const patchPath = resolvePatchFile(patchDir, spec.names);
-    planUnifiedPatch(spec.target(packageDir), readFileSync(patchPath, "utf8"), changes);
-  }
+  planUnifiedPatch(
+    packageDir,
+    readFileSync(resolvePatchFile(patchDir, profile.agentPatchNames, packageDir), "utf8"),
+    changes,
+  );
+  const tuiDir = resolvePiTuiDir(packageDir);
+  planUnifiedPatch(tuiDir, readFileSync(resolvePatchFile(patchDir, profile.tuiPatchNames, tuiDir), "utf8"), changes);
 
   // Plan both dependency patches before touching disk. If either patch no
   // longer matches a newer Pi release, enabling the optimization leaves the

@@ -52,6 +52,7 @@ class FakeTerminal implements Terminal {
   clearScreen(): void {}
   setTitle(): void {}
   setProgress(): void {}
+  setProgramStatus(): void {}
 }
 
 function viewportPayload(output: string): string {
@@ -149,12 +150,12 @@ describe("Pi fullscreen viewport protocol", () => {
     batcher.dispose();
   });
 
-  it("reports the authoritative viewport, scrolls three lines per wheel event, and consumes scroll-to-bottom", () => {
+  it("reports the authoritative viewport, honors configured wheel lines, and consumes scroll-to-bottom", () => {
     const terminal = new FakeTerminal();
     const document = new Container();
     for (let index = 0; index < 48; index += 1) document.addChild(new SingleLineBlock(`line-${index}`));
     const scrollView = new ScrollView(document, { follow: "end", primary: true });
-    const tui = new TuiAltScreen(terminal, false, undefined, { mouse: true });
+    const tui = new TuiAltScreen(terminal, false, undefined, { mouse: true, wheelScrollLines: 3 });
     tui.setLayoutRoot(scrollView);
     tui.start();
     tui.renderNow();
@@ -238,7 +239,10 @@ describe("Pi fullscreen viewport protocol", () => {
     tui.setLayoutRoot(scrollView);
     // What InteractiveMode does for each UserMessageComponent.
     (tui as unknown as { ePiNavBlocks: unknown[] }).ePiNavBlocks = [blocks[5], blocks[20]];
-    (tui as unknown as { ePiNavLabels: string[] }).ePiNavLabels = ["fix the login bug", "add a nav rail; with semicolons"];
+    (tui as unknown as { ePiNavLabels: string[] }).ePiNavLabels = [
+      "fix the login bug",
+      "add a nav rail; with semicolons",
+    ];
     tui.start();
     tui.renderNow();
 

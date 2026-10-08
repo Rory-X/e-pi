@@ -44,6 +44,7 @@ import { vi } from "vitest";
 
 import { applyPiCompatibilityPatches } from "../electron/main/services/pi-compatibility-service";
 import {
+  addUndeclaredRuntimeCompanions,
   applyPiUpdate,
   PI_COMPATIBILITY_REQUIRED_PREFIX,
   resetPiUpdateCacheForTests,
@@ -152,6 +153,42 @@ describe("applyPiUpdate", () => {
     const parent = join(process.env.PI_PACKAGE_DIR!, "..");
     const leftovers = readdirSync(parent).filter((name: string) => name.includes(".old-"));
     expect(leftovers).toEqual([]);
+  });
+});
+
+describe("addUndeclaredRuntimeCompanions", () => {
+  it("injects pi-server only for 0.85.0, whose published dist imports it", () => {
+    const pkg: Record<string, unknown> = { dependencies: { "@earendil-works/pi-tui": "0.85.0" } };
+    expect(addUndeclaredRuntimeCompanions(pkg, "0.85.0")).toEqual(["@earendil-works/pi-server"]);
+    const deps = pkg.dependencies as Record<string, string>;
+    expect(deps["@earendil-works/pi-server"]).toBe("0.85.0");
+    // Existing dependencies survive.
+    expect(deps["@earendil-works/pi-tui"]).toBe("0.85.0");
+  });
+
+  it("leaves fixed and unaffected versions untouched", () => {
+    // 0.85.1 removed the experimental code, so it needs no companion.
+    const fixed: Record<string, unknown> = { dependencies: { "@earendil-works/pi-tui": "0.85.1" } };
+    expect(addUndeclaredRuntimeCompanions(fixed, "0.85.1")).toEqual([]);
+    expect(fixed.dependencies).toEqual({ "@earendil-works/pi-tui": "0.85.1" });
+
+    const older: Record<string, unknown> = { dependencies: { "@earendil-works/pi-tui": "0.84.2" } };
+    expect(addUndeclaredRuntimeCompanions(older, "0.84.2")).toEqual([]);
+    expect(older.dependencies).toEqual({ "@earendil-works/pi-tui": "0.84.2" });
+  });
+
+  it("does not overwrite an already-declared companion", () => {
+    const pkg: Record<string, unknown> = {
+      dependencies: { "@earendil-works/pi-server": "^0.85.0" },
+    };
+    expect(addUndeclaredRuntimeCompanions(pkg, "0.85.0")).toEqual([]);
+    expect((pkg.dependencies as Record<string, string>)["@earendil-works/pi-server"]).toBe("^0.85.0");
+  });
+
+  it("creates a dependencies object when the package has none", () => {
+    const pkg: Record<string, unknown> = {};
+    expect(addUndeclaredRuntimeCompanions(pkg, "0.85.0")).toEqual(["@earendil-works/pi-server"]);
+    expect(pkg.dependencies).toEqual({ "@earendil-works/pi-server": "0.85.0" });
   });
 });
 

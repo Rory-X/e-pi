@@ -632,10 +632,16 @@ function capCustomDialog(component: CustomDialogComponent, termRows: () => numbe
 }
 
 /**
- * Pi-permission-system (and other extensions) render `ctx.ui.custom` into the
+ * Inline `ctx.ui.custom` (permission confirm, `overlay: false`) renders in the
  * editor dock. E-Pi's dock minSize is 0, so a long bash preview grows until it
- * covers the transcript and the action rows are clipped. Wrap every custom UI
- * so height is capped and Yes/No stay visible.
+ * covers the transcript and the action rows are clipped. Cap only that path
+ * so Yes/No stay visible.
+ *
+ * Overlay custom UIs (`overlay: true`) — the ask card and the permission
+ * settings modal — are not docked. Leave them at their own content height.
+ * The ask card already scrolls its option list inside the card when the
+ * questionnaire is taller than the terminal, and keeps the header and the
+ * shortcut footer.
  */
 function installCappedCustomDialogs(ctx: ExtensionContext): void {
   const ui = ctx.ui;
@@ -644,6 +650,7 @@ function installCappedCustomDialogs(ctx: ExtensionContext): void {
     ui.custom = ((factory, options) =>
       originalCustom((tui, theme, keybindings, done) => {
         const created = factory(tui, theme, keybindings, done);
+        if (options?.overlay) return created;
         const cap = (component: CustomDialogComponent) => capCustomDialog(component, () => tui.terminal.rows);
         return created instanceof Promise ? created.then(cap) : cap(created);
       }, options)) as typeof ui.custom;

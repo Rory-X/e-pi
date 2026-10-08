@@ -128,6 +128,7 @@ describe("e-pi bridge custom dialog height cap", () => {
           keybindings: unknown,
           done: (result: unknown) => void,
         ) => { render: (width: number) => string[]; invalidate: () => void; handleInput?: (data: string) => void },
+        _options?: { overlay?: boolean },
       ) => {
         const tui = { terminal: { rows: 36 } };
         const component = factory(tui, {}, {}, () => undefined);
@@ -152,22 +153,88 @@ describe("e-pi bridge custom dialog height cap", () => {
     sessionStart({}, ctx);
     expect(ctx.ui.custom).not.toBe(originalCustom);
 
-    const rendered = (await ctx.ui.custom((_tui, _theme, _keys, _done) => ({
-      render: () => [
-        "Permission Required",
-        ...Array.from({ length: 80 }, (_, i) => `command-line-${i}`),
-        "",
-        "▶ (y) Yes",
-        "  (n) No",
-        "",
-        "enter confirm",
-      ],
-      invalidate: () => undefined,
-      handleInput: () => undefined,
-    }))) as string[];
+    const rendered = (await ctx.ui.custom(
+      (_tui, _theme, _keys, _done) => ({
+        render: () => [
+          "Permission Required",
+          ...Array.from({ length: 80 }, (_, i) => `command-line-${i}`),
+          "",
+          "▶ (y) Yes",
+          "  (n) No",
+          "",
+          "enter confirm",
+        ],
+        invalidate: () => undefined,
+        handleInput: () => undefined,
+      }),
+      { overlay: false },
+    )) as string[];
     expect(rendered.length).toBe(dialogMaxHeight(36));
     expect(rendered[0]).toBe("Permission Required");
     expect(rendered.at(-1)).toBe("enter confirm");
     expect(rendered).toContain("▶ (y) Yes");
+  });
+
+  it("leaves overlay dialogs at content height", async () => {
+    const { handlers } = loadBridge();
+    const sessionStart = handlers.get("session_start")!;
+    const originalCustom = vi.fn(
+      async (
+        factory: (
+          tui: { terminal: { rows: number } },
+          theme: unknown,
+          keybindings: unknown,
+          done: (result: unknown) => void,
+        ) => { render: (width: number) => string[]; invalidate: () => void },
+        _options?: { overlay?: boolean },
+      ) => {
+        const component = factory({ terminal: { rows: 36 } }, {}, {}, () => undefined);
+        return component.render(80);
+      },
+    );
+    const ctx = {
+      model: undefined,
+      thinkingLevel: "off",
+      getContextUsage: () => undefined,
+      sessionManager: {
+        getEntries: () => [],
+        getSessionFile: () => undefined,
+      },
+      ui: {
+        custom: originalCustom,
+        setHeader: vi.fn(),
+        setFooter: vi.fn(),
+        setEditorComponent: vi.fn(),
+      },
+    };
+    sessionStart({}, ctx);
+
+    const lines = [
+      "Question",
+      ...Array.from({ length: 20 }, (_, i) => `desc-${i}`),
+      "option-1",
+      "option-2",
+      "option-3",
+      "option-4",
+      "option-5",
+      "",
+      "↑/↓ move",
+      "enter confirm",
+      "esc cancel",
+      "1-5 select",
+      "type custom",
+      "tab next",
+      "hint",
+    ];
+    const rendered = (await ctx.ui.custom(
+      () => ({
+        render: () => lines,
+        invalidate: () => undefined,
+      }),
+      { overlay: true },
+    )) as string[];
+    expect(rendered).toEqual(lines);
+    expect(rendered).toContain("option-5");
+    expect(rendered).not.toContain("…");
   });
 });

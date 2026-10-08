@@ -1,6 +1,16 @@
-import { Container, ScrollView, Spacer, stripTerminalSequences, Text, VStack } from "@earendil-works/pi-tui";
-import { renderLayoutFrame } from "@earendil-works/pi-tui/dist/layout.js";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { execFileSync } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { pathToFileURL } from "node:url";
+
+import * as bundledTui from "@earendil-works/pi-tui";
+import { renderLayoutFrame as bundledRenderLayoutFrame } from "@earendil-works/pi-tui/dist/layout.js";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+
+import { applyUnifiedPatch } from "../electron/main/services/pi-compatibility-service";
+
+type ScrollView = bundledTui.ScrollView;
 
 class CountingBlock {
   readonly calls = new Map<number, number>();
@@ -37,39 +47,96 @@ class VolatileBlock {
   invalidate(): void {}
 }
 
-function makeTranscript(
-  count: number,
-  lineCount: (width: number, id: number) => number,
-): { blocks: CountingBlock[]; scrollView: ScrollView } {
-  const document = new Container();
-  const chat = new Container();
-  const blocks = Array.from({ length: count }, (_, id) => new CountingBlock(id, lineCount));
-  for (const block of blocks) chat.addChild(block);
-  document.addChild(chat);
-  return {
-    blocks,
-    scrollView: new ScrollView(document, { follow: "end", primary: true }),
-  };
-}
+describe.each(["bundled 1.1.0", "published 0.99.1"])("patched pi-tui virtual transcript layout (%s)", (version) => {
+  let { Container, ScrollView, Spacer, stripTerminalSequences, Text, VStack } = bundledTui;
+  let renderLayoutFrame = bundledRenderLayoutFrame;
+  let publishedRoot: string | undefined;
 
-function visibleText(lines: readonly string[]): string[] {
-  return lines.map((line) => stripTerminalSequences(line).trimEnd());
-}
+  beforeAll(async () => {
+    if (version !== "published 0.99.1") return;
+    // Run the same behavioral suite on the real new TUI, including its actual
+    // dependency versions, instead of only checking that source markers exist.
+    const cache = join(tmpdir(), "e-pi-pi-tarballs");
+    const tarball = join(cache, "pi-tui-0.99.1.tgz");
+    mkdirSync(cache, { recursive: true });
+    if (!existsSync(tarball)) {
+      const response = await fetch("https://registry.npmjs.org/@earendil-works/pi-tui/-/pi-tui-0.99.1.tgz", {
+        signal: AbortSignal.timeout(60_000),
+      });
+      if (!response.ok) throw new Error(`registry responded ${response.status}`);
+      writeFileSync(tarball, Buffer.from(await response.arrayBuffer()));
+    }
+    publishedRoot = mkdtempSync(join(tmpdir(), "e-pi-virtual-0991-"));
+    execFileSync("tar", ["-xzf", tarball, "-C", publishedRoot, "--strip-components=1"]);
+    const pkgPath = join(publishedRoot, "package.json");
+    const pkg = JSON.parse(readFileSync(pkgPath, "utf8"));
+    delete pkg.devDependencies;
+    delete pkg.scripts;
+    writeFileSync(pkgPath, JSON.stringify(pkg));
+    execFileSync(
+      "npm",
+      [
+        "install",
+        "--omit=dev",
+        "--ignore-scripts",
+        "--no-audit",
+        "--no-fund",
+        "--package-lock=false",
+        "--cache",
+        join(tmpdir(), "e-pi-npm-cache"),
+      ],
+      {
+        cwd: publishedRoot,
+        stdio: "pipe",
+        timeout: 120_000,
+      },
+    );
+    applyUnifiedPatch(
+      publishedRoot,
+      readFileSync(join(process.cwd(), "patches/@earendil-works__pi-tui@0.99.1.patch"), "utf8"),
+    );
+    const tui = await import(pathToFileURL(join(publishedRoot, "dist/index.js")).href);
+    const layout = await import(pathToFileURL(join(publishedRoot, "dist/layout.js")).href);
+    ({ Container, ScrollView, Spacer, stripTerminalSequences, Text, VStack } = tui);
+    renderLayoutFrame = layout.renderLayoutFrame;
+  }, 180_000);
 
-function expectedTail(blocks: CountingBlock[], width: number, height: number): string[] {
-  return blocks.flatMap((block) => block.expected(width)).slice(-height);
-}
+  afterAll(() => {
+    if (publishedRoot) rmSync(publishedRoot, { recursive: true, force: true });
+  });
 
-beforeEach(() => {
-  process.env.E_PI_TUI_OPTIMIZATIONS = "true";
-});
+  function makeTranscript(
+    count: number,
+    lineCount: (width: number, id: number) => number,
+  ): { blocks: CountingBlock[]; scrollView: ScrollView } {
+    const document = new Container();
+    const chat = new Container();
+    const blocks = Array.from({ length: count }, (_, id) => new CountingBlock(id, lineCount));
+    for (const block of blocks) chat.addChild(block);
+    document.addChild(chat);
+    return {
+      blocks,
+      scrollView: new ScrollView(document, { follow: "end", primary: true }),
+    };
+  }
 
-afterEach(() => {
-  vi.useRealTimers();
-  delete process.env.E_PI_TUI_OPTIMIZATIONS;
-});
+  function visibleText(lines: readonly string[]): string[] {
+    return lines.map((line) => stripTerminalSequences(line).trimEnd());
+  }
 
-describe("patched pi-tui virtual transcript layout", () => {
+  function expectedTail(blocks: CountingBlock[], width: number, height: number): string[] {
+    return blocks.flatMap((block) => block.expected(width)).slice(-height);
+  }
+
+  beforeEach(() => {
+    process.env.E_PI_TUI_OPTIMIZATIONS = "true";
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    delete process.env.E_PI_TUI_OPTIMIZATIONS;
+  });
+
   it("uses Pi's stock full transcript layout while the patch is disabled", () => {
     process.env.E_PI_TUI_OPTIMIZATIONS = "false";
     const { blocks, scrollView } = makeTranscript(40, () => 1);

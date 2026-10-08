@@ -22,6 +22,18 @@ const INSTALL_TIMEOUT_MS = 10 * 60_000;
 const CACHE_TTL_MS = 10 * 60 * 1000;
 export const PI_COMPATIBILITY_REQUIRED_PREFIX = "E_PI_TUI_COMPATIBILITY_REQUIRED";
 
+/**
+ * 0.85.0 published experimental code whose `dist/experimental/server.js`
+ * statically imports this package, but omitted it from `dependencies`. The
+ * import is on `cli.js`'s load path, so the package cannot even start without
+ * it. 0.85.1 removed the experimental code entirely, so only 0.85.0 is
+ * affected. Kept minimal and version-gated rather than scanning `dist`: the
+ * offending import is known and fixed upstream.
+ */
+const UNDECLARED_RUNTIME_COMPANIONS: Readonly<Record<string, readonly string[]>> = {
+  "0.85.0": ["@earendil-works/pi-server"],
+};
+
 let cached: { at: number; latest: string | undefined } | undefined;
 
 /** Test hook: isolate registry/update cache state between cases. */
@@ -44,6 +56,32 @@ export function versionGt(a: string, b: string): boolean {
     if (diff !== 0) return diff > 0;
   }
   return false;
+}
+
+/**
+ * Add companions that a published version imports but omitted from
+ * `dependencies`, so a standalone `npm install --omit=dev` yields a loadable
+ * package. Version-gated: only releases with a known defect are touched, so a
+ * fixed release never picks up a dependency it does not need.
+ *
+ * Exported for tests.
+ */
+export function addUndeclaredRuntimeCompanions(pkg: Record<string, unknown>, version: string): string[] {
+  const wanted = UNDECLARED_RUNTIME_COMPANIONS[version];
+  if (!wanted || wanted.length === 0) return [];
+
+  const deps =
+    pkg.dependencies && typeof pkg.dependencies === "object" && !Array.isArray(pkg.dependencies)
+      ? (pkg.dependencies as Record<string, string>)
+      : {};
+  pkg.dependencies = deps;
+  const added: string[] = [];
+  for (const name of wanted) {
+    if (deps[name]) continue;
+    deps[name] = version;
+    added.push(name);
+  }
+  return added;
 }
 
 /**
@@ -176,6 +214,10 @@ export async function applyPiUpdate(
     const pkg = JSON.parse(readFileSync(pkgPath, "utf8")) as Record<string, unknown>;
     delete pkg.devDependencies;
     delete pkg.scripts;
+    const companions = addUndeclaredRuntimeCompanions(pkg, latest);
+    if (companions.length > 0) {
+      debugLog("[pi-update] adding undeclared runtime companions", { latest, companions });
+    }
     writeFileSync(pkgPath, JSON.stringify(pkg, null, 2));
 
     debugLog("[pi-update] installing dependencies", { latest });

@@ -78,7 +78,7 @@ One-time alternatives: right-click **E-Pi** → **Open** → **Open**, or **Syst
 
 ### Prerequisites
 
-- Node.js 20+ (Node 22 LTS recommended)
+- Node.js 22.19+ (the bundled runtime uses Node 22.23.2)
 - pnpm 10
 
 ### Install & Run (development)

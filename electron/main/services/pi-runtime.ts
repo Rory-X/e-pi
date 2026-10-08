@@ -59,6 +59,22 @@ function resolveBridgePath(): string {
 }
 
 /**
+ * Preload that installs E-Pi's runtime TUI hooks in the session process.
+ *
+ * Resolved by existence rather than `app.isPackaged` so it also works from a
+ * source checkout, where `process.resourcesPath` may point at the Electron
+ * binary's own resources. Returns undefined when the file is missing, so a
+ * build without the hooks still spawns pi normally.
+ */
+function resolveTuiPreloadPath(): string | undefined {
+  const candidates = [
+    ...(typeof process.resourcesPath === "string" ? [join(process.resourcesPath, "e-pi-tui-preload.mjs")] : []),
+    join(app.getAppPath(), "resources", "e-pi-tui-preload.mjs"),
+  ];
+  return candidates.find((candidate) => existsSync(candidate));
+}
+
+/**
  * The binary that runs each session's pi process. Defaults to the bundled
  * sidecar Node (`resources/node/bin/node`) — a plain Node binary with no
  * app-bundle association. Spawning the Electron main binary
@@ -397,6 +413,14 @@ export class PiRuntime {
       const nodeBinary = resolveNodeBinary();
       const tuiOptimizationsEnabled = isTuiOptimizationsEnabled();
       const args = [resolvePiEntry(), "--session", sessionPath, "--extension", resolveBridgePath()];
+      // `--import` must precede the entry script: Node runs preloads before it
+      // resolves the entry, and the hooks have to be installed before any pi
+      // module is loaded. The preload installs them unconditionally and each
+      // injector checks E_PI_TUI_OPTIMIZATIONS at the point it acts, so
+      // toggling the setting takes effect without changing the spawn.
+      const preloadPath = resolveTuiPreloadPath();
+      if (preloadPath) args.unshift("--import", preloadPath);
+      else debugLog("[runtime] TUI hook preload not found; running without runtime injection", { sessionPath });
       if (tuiOptimizationsEnabled) {
         // E-Pi owns the outer composer and terminal viewport. Pi's regular
         // main-screen renderer rebuilds and retransmits the entire session
